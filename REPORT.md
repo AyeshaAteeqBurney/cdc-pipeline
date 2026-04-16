@@ -8,6 +8,84 @@ Your group's custom scenario is (or will be :-)) described in your repository's 
 
 ---
 
+## Draft for report with steps:
+
+### 1. Debezium CDC connector
+
+#### Completed
+
+- **Connector definition** lives in `config/debezium-postgres-connector.json` (connector name `pg-cdc`). It uses the Debezium **PostgreSQL** connector with **`plugin.name` = `pgoutput`** (native logical decoding), **`snapshot.mode` = `initial`** so existing rows are emitted once before the change stream (appropriate for a dev lakehouse and for proving snapshot + CDC in Kafka).
+- **Captured tables:** `public.customers`, `public.drivers`. **Topic layout:** `dbserver1.public.<table>` (from `topic.prefix` + default routing).
+- **Registration automation:** `scripts/register_debezium_connector.py` POSTs/updates the config against the Kafka Connect REST API (`CONNECT_URL`, default `http://localhost:8083` from the host, or `http://connect:8083` inside Compose).
+- **Operational fixes applied while bringing the stack up:**
+  - **`publication.autocreate.mode`:** set to **`all_tables`** so PostgreSQL publication creation succeeds (filtered mode had failed with “no table filters” for the publication in our environment).
+  - **Credentials:** `database.password` aligned with the PostgreSQL user secret from `.env` (template had used a different placeholder password).
+- **Delete semantics:** `tombstones.on.delete` is **`true`** so delete operations can surface tombstone records in Kafka; downstream Bronze ingestion skips null payloads but still records deletes via non-tombstone envelopes where applicable.
+
+#### TODO (not blocking )
+
+- [ ] Screenshot or paste: connector status **RUNNING** from Connect UI or `GET /connectors/pg-cdc/status`.
+- [ ] Short justification for **`snapshot.mode`** vs alternatives (e.g. `never`) if you change it for production-style runs.
+- [ ] Evidence: sample **Kafka consumer** or topic inspection showing events on `dbserver1.public.customers` and `dbserver1.public.drivers`.
+- [ ] Document **`wal_level=logical`** confirmation on PostgreSQL (e.g. `SHOW wal_level;`) if not already in repo docs.
+
+---
+
+### 2. Bronze CDC layer (raw CDC event log)
+
+#### Completed
+
+- **Entrypoint:** `jobs/cdc_pipeline.py` with **`--stage bronze`** and **`--table customers|drivers`**. (Same script is intended to grow **`--stage silver`** for the `silver_cdc` Airflow task later.)
+- **Execution note:** run with **`spark-submit`** inside the `jupyter` service so Iceberg and Kafka packages match `PYSPARK_SUBMIT_ARGS` in `compose.yml` (plain `python` may miss the Spark classpath).
+- **Iceberg targets:** append-only tables **`lakehouse.cdc.bronze_customers_flex`** and **`lakehouse.cdc.bronze_drivers_flex`** (namespace `lakehouse.cdc` created if missing).
+- **Parsing:** Debezium **JSONConverter** envelope; fields read via **`$.payload.*`** JSON paths. **`op`**, **`ts_ms`**, **`source.lsn`**, and Kafka metadata (**topic, partition, offset, timestamp**) are stored. **`before`** and **`after`** are kept as **raw JSON strings** (`before_json`, `after_json`) for **schema-flexible** Bronze (future `ALTER TABLE` / bonus schema evolution without breaking ingestion).
+- **Tombstones:** rows with **null** Kafka value are **filtered out** before append (tombstone-only messages carry no payload to parse).
+- **Semantics:** **append-only** — no updates/deletes in Bronze; duplicates are a concern for Silver deduplication/MERGE, not Bronze.
+
+#### TODO
+
+- [ ] Paste **example row** (redacted) or notebook output: `op`, fragment of `after_json`, and Kafka offset columns.
+- [ ] **Row counts** after a controlled test (optional: align with simulator cadence).
+- [ ] If the DAG batches Bronze runs: document **`startingOffsets` / `endingOffsets`** strategy used in `cdc_pipeline.py` (currently CLI defaults) for idempotency.
+
+---
+
+### 3. Silver CDC layer (current-state mirror)
+
+**TODO:** Implement and document **incremental read from Bronze**, **dedupe by PK**, **`MERGE INTO`** silver Iceberg tables (`op = 'd'` delete; `u`/`c`/`r` upsert), idempotency proof, and validation vs PostgreSQL (counts + spot checks). Remove this stub when filled.
+
+---
+
+### 4. Airflow DAG, taxi Bronze orchestration, validation
+
+**TODO:** DAG graph screenshot, `connector_health` sensor, task dependencies, retries, SLA, three successful runs, failure example, backfill/idempotency narrative, **`validate`** task comparing Silver CDC to Postgres. Remove this stub when filled.
+
+---
+
+### 5. Taxi pipeline — Silver & Gold (improved from Project 2)
+
+#### Completed (implementation in `jobs/taxi_pipeline.py`)
+
+- **Silver (`--mode silver`):**
+  - **Timestamps:** `tpep_pickup_datetime` / `tpep_dropoff_datetime` parsed with **`to_timestamp(..., "yyyy-MM-dd'T'HH:mm:ss")`** into **`pickup_datetime`**, **`dropoff_datetime`**.
+  - **Casts:** Bronze string/double fields mapped to **typed** columns (`vendor_id`, `ratecode_id`, money fields as `double`, etc.) aligned with **`lakehouse.taxi.silver`** DDL.
+  - **Invalid trips dropped:** null pickup/dropoff, **`fare_amount < 0`**, **`trip_distance <= 0`**, passenger count null or outside **\[1, 8\]**, plus **deduplication** on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`.
+  - **Zone enrichment:** **`taxi_zone_lookup.parquet`** joined on pickup and dropoff location IDs → **`pickup_zone`**, **`dropoff_zone`** (broadcast joins).
+  - **Streaming:** Silver uses **Structured Streaming** from the **Iceberg Bronze** table with a **checkpoint** (default under `.checkpoints/silver`); an initial **batch** pass processes rows already in Bronze before the stream starts.
+- **Gold (`--mode gold`):**
+  - **Aggregation:** `date_trunc("hour", pickup_datetime)` as **`pickup_hour`**, grouped by **`pickup_hour`** and **`pickup_zone`**, with **`trip_count`**, **`avg_fare`**, **`avg_distance`**, **`total_revenue`**.
+  - **Write semantics:** **`overwritePartitions()`** on **`lakehouse.taxi.gold`**, table **partitioned by day of `pickup_hour`** (`days(pickup_hour)`).
+- **Project 2 carryover / improvement hook:** Logic is adapted from the Project 2 streaming notebook; **explicit Silver deduplication** and **typed Silver schema** are concrete hygiene improvements suitable to cite vs raw Bronze-shaped streams.
+
+#### TODO (not blocking — needs Airflow + final report pass)
+
+- [ ] **Airflow:** document tasks that invoke `taxi_pipeline.py` for **silver** and **gold** (and **bronze** if included in the DAG), including trigger intervals vs freshness SLA.
+- [ ] **Evidence:** Iceberg `SELECT` samples or counts for **`lakehouse.taxi.silver`** and **`lakehouse.taxi.gold`**; optional Spark UI screenshot.
+- [ ] **Feedback paragraph:** one short paragraph naming **at least one** concrete improvement tied to Project 2 feedback (fill in the actual feedback quote or paraphrase from your graded Project 2).
+- [ ] **Bronze taxi** path: if one teammate owns **`--mode bronze`**, link their notes here or in section 4 to avoid duplication.
+
+---
+
 ## What's in this template
 
 | Path | Description |

@@ -131,6 +131,50 @@ docker compose down -v       # also deletes stored Iceberg tables
 
 ---
 
+## Run pipeline jobs (this repo)
+
+Steps **1–7** above (`.env`, `compose up`, data under `data/`, **seed**, **produce**, **simulate**) are the prerequisites. Then:
+
+### Debezium connector
+
+From the **repository root** on the host (Python 3; uses only the standard library):
+
+```bash
+python scripts/register_debezium_connector.py --connect-url http://localhost:8083
+```
+
+This loads `config/debezium-postgres-connector.json`. Confirm the connector is **RUNNING**, e.g. open `http://localhost:8083/connectors` or check the Connect logs.
+
+### CDC Bronze → Iceberg (`jobs/cdc_pipeline.py`)
+
+Use **`spark-submit`** inside the `jupyter` container so Iceberg and Kafka match `PYSPARK_SUBMIT_ARGS` in `compose.yml`:
+
+```bash
+docker exec jupyter spark-submit /home/jovyan/project/jobs/cdc_pipeline.py --stage bronze --table customers
+docker exec jupyter spark-submit /home/jovyan/project/jobs/cdc_pipeline.py --stage bronze --table drivers
+```
+
+Iceberg tables: `lakehouse.cdc.bronze_customers_flex`, `lakehouse.cdc.bronze_drivers_flex` (query from Jupyter with Spark/Iceberg or `spark-sql` with the same catalog settings as in `pipeline/spark_session.py`).
+
+### Taxi medallion (`jobs/taxi_pipeline.py`)
+
+**Bronze** and **Silver** are long-running streaming jobs; **Gold** is a batch job that exits.
+
+```bash
+# Use separate terminals if running bronze + silver together.
+docker exec jupyter spark-submit /home/jovyan/project/jobs/taxi_pipeline.py --mode bronze
+docker exec jupyter spark-submit /home/jovyan/project/jobs/taxi_pipeline.py --mode silver
+docker exec jupyter spark-submit /home/jovyan/project/jobs/taxi_pipeline.py --mode gold
+```
+
+If `spark-submit` is not needed in your image, `docker exec jupyter python /home/jovyan/project/jobs/taxi_pipeline.py --mode …` may work; if you see missing Iceberg/Kafka classes, prefer `spark-submit`.
+
+### Airflow
+
+Place DAG files under `dags/` (mounted into the Airflow containers). Orchestration is not wired in the template; the group adds tasks that call the commands above on the chosen schedule.
+
+---
+
 ## What to build
 
 Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
