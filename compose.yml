@@ -160,8 +160,10 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - airflow-data:/opt/airflow
+      - /var/run/docker.sock:/var/run/docker.sock
     entrypoint: >
       /bin/bash -c "
+        apt-get update -qq && apt-get install -y -qq docker.io 2>/dev/null;
         airflow db migrate;
         airflow users create
           --username ${AIRFLOW_USER:-admin}

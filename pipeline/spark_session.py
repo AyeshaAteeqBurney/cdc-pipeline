@@ -12,6 +12,8 @@ def get_spark(app_name: str) -> SparkSession:
         SparkSession.builder.appName(app_name)
         .master("local[*]")
         .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.executor.heartbeatInterval", "60s")
+        .config("spark.network.timeout", "300s")
         .config(
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",

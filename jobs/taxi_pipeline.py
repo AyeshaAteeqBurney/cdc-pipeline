@@ -142,7 +142,7 @@ def _taxi_schema() -> StructType:
     )
 
 
-def run_bronze_stream(spark, bootstrap: str, topic: str, checkpoint: str, trigger: str) -> None:
+def run_bronze_stream(spark, bootstrap: str, topic: str, checkpoint: str, trigger: str, once: bool = False) -> None:
     raw_stream = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", bootstrap)
@@ -187,16 +187,19 @@ def run_bronze_stream(spark, bootstrap: str, topic: str, checkpoint: str, trigge
         )
 
     os.makedirs(checkpoint, exist_ok=True)
-    q = (
+    writer = (
         parsed_stream.writeStream.foreachBatch(_write_bronze_batch)
         .option("checkpointLocation", checkpoint)
-        .trigger(processingTime=trigger)
-        .start()
     )
-    q.awaitTermination()
+    if once:
+        q = writer.trigger(availableNow=True).start()
+        q.awaitTermination(300)
+    else:
+        q = writer.trigger(processingTime=trigger).start()
+        q.awaitTermination()
 
 
-def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: str) -> None:
+def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: str, once: bool = False) -> None:
     zone_lookup = (
         spark.read.parquet(zone_lookup_path)
         .select(F.col("LocationID").cast("int").alias("location_id"), F.col("Zone").alias("zone_name"))
@@ -276,19 +279,23 @@ def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: st
 
         enriched.writeTo("lakehouse.taxi.silver").append()
 
-    # Batch bootstrap: process what’s already in bronze once.
+    # When once=True (Airflow mode), a plain batch read covers everything available.
+    # Skipping the streaming query avoids a Spark 4.x BlockManagerId NPE with
+    # trigger(availableNow=True) on Iceberg sources.
     _process_silver_batch(spark.read.table("lakehouse.taxi.bronze"), 0)
+    if once:
+        return
 
     os.makedirs(checkpoint, exist_ok=True)
-    q = (
+    (
         spark.readStream.format("iceberg")
         .load("lakehouse.taxi.bronze")
         .writeStream.foreachBatch(_process_silver_batch)
         .option("checkpointLocation", checkpoint)
         .trigger(processingTime=trigger)
         .start()
+        .awaitTermination()
     )
-    q.awaitTermination()
 
 
 def run_gold_batch(spark) -> None:
@@ -315,15 +322,16 @@ def main() -> None:
     p.add_argument("--bronze-checkpoint", default="/home/jovyan/project/.checkpoints/bronze")
     p.add_argument("--silver-checkpoint", default="/home/jovyan/project/.checkpoints/silver")
     p.add_argument("--zone-lookup", default="/home/jovyan/project/data/taxi_zone_lookup.parquet")
+    p.add_argument("--once", action="store_true", help="Process available data and exit (for Airflow)")
     args = p.parse_args()
 
     spark = get_spark(f"project3-taxi-{args.mode}")
     _ensure_namespaces_and_tables(spark)
 
     if args.mode == "bronze":
-        run_bronze_stream(spark, args.bootstrap, args.topic, args.bronze_checkpoint, args.trigger)
+        run_bronze_stream(spark, args.bootstrap, args.topic, args.bronze_checkpoint, args.trigger, once=args.once)
     elif args.mode == "silver":
-        run_silver_stream(spark, args.zone_lookup, args.silver_checkpoint, args.trigger)
+        run_silver_stream(spark, args.zone_lookup, args.silver_checkpoint, args.trigger, once=args.once)
     else:
         run_gold_batch(spark)
 

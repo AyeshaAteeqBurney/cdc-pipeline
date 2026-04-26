@@ -241,13 +241,19 @@ def run_health(spark) -> None:
         ORDER BY run_timestamp DESC
     """).show(truncate=False)
 
+    return int(silver_pg_delta)
+
 
 def main() -> None:
     spark = get_spark("project3-cdc-health")
     try:
-        run_health(spark)
+        drift = run_health(spark)
     finally:
         spark.stop()
+
+    if drift != 0:
+        print(f"VALIDATE FAILED: silver_pg_delta={drift}. Silver does not mirror PostgreSQL.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
