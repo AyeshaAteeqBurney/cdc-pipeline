@@ -1,14 +1,6 @@
 # Project 3 — CDC + Orchestrated Lakehouse Pipeline
 
-Build a CDC pipeline that captures changes from a PostgreSQL database using Debezium,
-lands them in an Apache Iceberg lakehouse (bronze → silver), **and** continues the
-streaming taxi pipeline from Project 2 — now orchestrated end-to-end with Apache Airflow.
-
-Your group's custom scenario is (or will be :-)) described in your repository's GitHub issue.
-
 ---
-
-## Draft for report with steps:
 
 ### 1. Debezium CDC connector
 
@@ -119,7 +111,80 @@ For example, rolling back to snapshot `7734156091704858789` would restore silver
 
 ### 4. Airflow DAG, taxi Bronze orchestration, validation
 
-**TODO:** DAG graph screenshot, `connector_health` sensor, task dependencies, retries, SLA, three successful runs, failure example, backfill/idempotency narrative, **`validate`** task comparing Silver CDC to Postgres. Remove this stub when filled.
+#### DAG design
+
+The DAG file is `dags/cdc_lakehouse_dag.py`. It orchestrates both pipelines under a single schedule with the following configuration:
+
+| Setting | Value | Reason |
+|---|---|---|
+| `schedule_interval` | `*/15 * * * *` | 15-minute freshness SLA — balances latency against Spark startup overhead (~30s per task) |
+| `max_active_runs` | `1` | Prevents overlapping runs that would cause silver MERGE conflicts |
+| `catchup` | `False` | On restart, only the most recent interval runs — avoids flooding with historical backfill |
+| `dagrun_timeout` | `1 hour` | DAG is killed if tasks stall (e.g. Spark hangs) |
+| `retries` | `2` per task | Each task retries twice with a 30-second delay before marking failed |
+
+#### Task dependency chain
+
+```
+connector_health (HttpSensor)
+    ├── bronze_cdc_customers ──► silver_cdc_customers ──┐
+    ├── bronze_cdc_drivers   ──► silver_cdc_drivers   ──┼──► validate
+    └── bronze_taxi ──► silver_taxi ──► gold_taxi        │
+                                                         │
+                        [silver_cdc_customers + silver_cdc_drivers must both succeed]
+```
+
+- **`connector_health`** is an `HttpSensor` polling `http://connect:8083/connectors/pg-cdc/status` every 10 seconds. If the connector is not RUNNING the entire DAG stops — there is no point ingesting if CDC is broken.
+- The three bronze tasks run in parallel after the sensor passes.
+- CDC silver tasks each depend on their own bronze task. Both must succeed before `validate` runs.
+- The taxi path (`bronze_taxi → silver_taxi → gold_taxi`) runs independently in parallel with CDC.
+- **`validate`** (`jobs/health_pipeline.py`) compares `silver_customers.count() + silver_drivers.count()` against live PostgreSQL counts. It writes one row to `lakehouse.cdc.gold_pipeline_health` and exits with code 1 if `silver_pg_delta ≠ 0`, causing Airflow to mark it failed.
+
+#### DAG graph — successful run
+
+![DAG graph all green](dag_graph_success.png.jpeg)
+
+*`manual_catchup_run_1` — all 9 tasks green. Run duration: ~4 minutes.*
+
+#### Scheduling strategy
+
+A 15-minute interval means silver CDC lags PostgreSQL by at most 15 minutes plus task execution time (~2 minutes), for a worst-case freshness of ~17 minutes. This is acceptable for a near-real-time analytics lakehouse. For stricter SLAs the interval could be reduced to 5 minutes; below that the Spark JVM startup cost (~30s) becomes a significant fraction of total runtime.
+
+#### Retry and failure handling
+
+Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka Connect is down), the sensor times out and all downstream tasks are skipped via `upstream_failed`. If a silver MERGE fails, `validate` does not run.
+
+**Example failed run** — `scheduled__2026-04-26T17:45:00`:
+
+`simulate.py` was left running during this interval, continuously inserting rows into PostgreSQL between the time silver tasks completed and when `validate` ran. Silver had processed 32 rows but PostgreSQL had grown to 91 rows by validate time, producing `silver_pg_delta = -59`. Airflow retried `validate` twice (both failed), then marked the run failed. The following run (`manual_catchup_run_1`) caught up all outstanding Kafka events and `validate` passed with `silver_pg_delta = 0`.
+
+![Failed run details](dag_fail.png.jpeg)
+
+#### Three successful consecutive runs
+
+| Run ID | Type | Start (UTC) | Duration | validate |
+|---|---|---|---|---|
+| `manual_clean_run_2` | manual | 2026-04-26 17:54:05 | 04:42 | success |
+| `manual_catchup_run_1` | manual | 2026-04-26 18:08:30 | 04:06 | success |
+| `scheduled__2026-04-26T18:00:00` | scheduled | 2026-04-26 18:15:01 | 03:50 | success |
+
+![Scheduled run success](dag_success.png.jpeg)
+
+#### Backfill and idempotency
+
+With `catchup=False`, no automatic backfill occurs. Manual backfill via `airflow dags backfill` is safe because:
+- Bronze re-reads from Kafka `earliest` but silver's `kafka_offset > watermark` filter skips already-processed events.
+- The silver MERGE is idempotent: re-applying the same events produces the same silver state.
+- Running the DAG twice for the same interval with no new changes prints `No new bronze events for customers, silver is up to date.` and exits cleanly.
+
+#### Validate task
+
+`jobs/health_pipeline.py` runs as the final task. It:
+1. Counts `silver_customers + silver_drivers` via Spark.
+2. Fetches live `COUNT(*)` from PostgreSQL via `psycopg2`.
+3. Computes `silver_pg_delta = silver_count - pg_count`.
+4. Appends one health record to `lakehouse.cdc.gold_pipeline_health`.
+5. Exits with code 1 if `delta ≠ 0` (Airflow marks task failed).
 
 ---
 
@@ -138,12 +203,29 @@ For example, rolling back to snapshot `7734156091704858789` would restore silver
   - **Write semantics:** **`overwritePartitions()`** on **`lakehouse.taxi.gold`**, table **partitioned by day of `pickup_hour`** (`days(pickup_hour)`).
 - **Project 2 carryover / improvement hook:** Logic is adapted from the Project 2 streaming notebook; **explicit Silver deduplication** and **typed Silver schema** are concrete hygiene improvements suitable to cite vs raw Bronze-shaped streams.
 
-#### TODO (not blocking — needs Airflow + final report pass)
+#### Evidence
 
-- [ ] **Airflow:** document tasks that invoke `taxi_pipeline.py` for **silver** and **gold** (and **bronze** if included in the DAG), including trigger intervals vs freshness SLA.
-- [ ] **Evidence:** Iceberg `SELECT` samples or counts for **`lakehouse.taxi.silver`** and **`lakehouse.taxi.gold`**; optional Spark UI screenshot.
-- [ ] **Feedback paragraph:** one short paragraph naming **at least one** concrete improvement tied to Project 2 feedback (fill in the actual feedback quote or paraphrase from your graded Project 2).
-- [ ] **Bronze taxi** path: if one teammate owns **`--mode bronze`**, link their notes here or in section 4 to avoid duplication.
+**Table row counts** after full pipeline run (Jan + Feb 2025 taxi data):
+
+| Table | Rows |
+|---|---|
+| `lakehouse.taxi.bronze` | 109,546 |
+| `lakehouse.taxi.silver` | 1,139,464 |
+| `lakehouse.taxi.gold` | 3,484 |
+
+**Top gold rows by revenue** (pickup_hour, zone, aggregates):
+
+| pickup_hour | pickup_zone | trip_count | avg_fare | avg_distance | total_revenue |
+|---|---|---|---|---|---|
+| 2025-01-01 21:00 | JFK Airport | 4,692 | $65.08 | 16.16 mi | $385,989 |
+| 2025-01-01 19:00 | JFK Airport | 4,524 | $64.56 | 16.08 mi | $367,781 |
+| 2025-01-01 16:00 | JFK Airport | 4,212 | $65.78 | 16.27 mi | $352,770 |
+
+**Airflow tasks:** `bronze_taxi` runs `taxi_pipeline.py --mode bronze --once`, `silver_taxi` runs `--mode silver --once`, `gold_taxi` runs `--mode gold`. All triggered every 15 minutes by the DAG. The `--once` flag causes each job to process available data and exit rather than running as a continuous stream.
+
+#### Improvement over Project 2
+
+In Project 2, the silver taxi job processed raw Bronze rows without schema validation, allowing null pickup timestamps and zero-distance trips to flow into aggregations and skew gold metrics. In this project, the silver stage applies explicit quality filters — dropping rows where `pickup_datetime` or `dropoff_datetime` is null, `fare_amount < 0`, `trip_distance ≤ 0`, or `passenger_count` is outside \[1, 8\] — and deduplicates on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`. This produces a clean, typed silver table that gold aggregations can trust without further filtering.
 
 ---
 
