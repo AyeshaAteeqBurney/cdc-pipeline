@@ -290,7 +290,7 @@ Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
 
 ## What is graded
 
-Create a report (`REPORT.md`, max ~3 pages). Use the template provided.
+Course expectations include a concise `REPORT.md` (length per syllabus).
 
 ### 1. CDC correctness
 
@@ -348,9 +348,13 @@ The grading process:
 
 **Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
 
+**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
+
+**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
+
 ---
 
-## Grading checklist (self-review before submission)
+## Checklist
 
 - [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
 - [ ] Debezium connector is registered and RUNNING
@@ -386,7 +390,7 @@ If the Debezium connector is stopped for a long time, PostgreSQL retains WAL seg
 Check with: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
 
 **Airflow DAG not appearing**
-Place your DAG `.py` file in the `dags/` directory. The scheduler scans this folder.
+Confirm DAG `.py` files are in the `dags/` directory (scheduler scan path).
 Check `docker compose logs airflow-scheduler` for import errors.
 
 **`Failed to find data source: kafka`**

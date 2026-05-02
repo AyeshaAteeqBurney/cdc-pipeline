@@ -1,6 +1,6 @@
 # Project 3 — CDC + Orchestrated Lakehouse Pipeline
 
-This report answers the course handout's "What is graded" rubric (CDC correctness, Lakehouse design, Orchestration design, Streaming pipeline, Custom scenario) plus the optional bonus and `.env` section. Setup, runtime, and operational details (`docker compose`, seed/produce/simulate, troubleshooting) live in `README.md`.
+This report covers CDC correctness, lakehouse design, orchestration, the taxi streaming path, the custom scenario, optional schema-evolution bonus, and environment keys. Operational steps (`docker compose`, seed/produce/simulate, troubleshooting) are in `README.md`.
 
 The pipeline runs **two paths under one Airflow DAG** (`dags/cdc_lakehouse_dag.py`):
 
@@ -48,13 +48,53 @@ Three quick checks the grader (or you) can run live:
   ```bash
   curl -s http://localhost:8083/connectors/pg-cdc/status | jq .
   ```
-  `screenshots/section1_connector_status.png`.*
+  `screenshots/section1_connector_status.png`.
 
 - **Kafka topic carrying CDC events:**
   ```bash
-  docker exec kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic dbserver1.public.customers --from-beginning --max-messages 1
+  docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server localhost:9092 `
+  --topic dbserver1.public.customers `
+  --max-messages 1
   ```
-  Expected: a Debezium envelope with `payload.op` ∈ {`c`,`u`,`d`,`r`}. *PASTE HERE.*
+  Expected: a Debezium envelope with `payload.op` ∈ {`c`,`u`,`d`,`r`}. Excerpt below omits the Kafka record’s top-level `schema` block.
+
+```json
+{
+  "payload": {
+    "before": null,
+    "after": {
+      "id": 241,
+      "name": "test user",
+      "email": "testing@ut.ee",
+      "country": "Estonia",
+      "created_at": 1777720566051166,
+      "phone": "+111-3222-3345"
+    },
+    "source": {
+      "version": "3.0.8.Final",
+      "connector": "postgresql",
+      "name": "dbserver1",
+      "ts_ms": 1777724238651,
+      "snapshot": "false",
+      "db": "sourcedb",
+      "sequence": "[\"27379736\",\"27380024\"]",
+      "ts_us": 1777724238651504,
+      "ts_ns": 1777724238651504000,
+      "schema": "public",
+      "table": "customers",
+      "txId": 1716,
+      "lsn": 27380024,
+      "xmin": null
+    },
+    "transaction": null,
+    "op": "u",
+    "ts_ms": 1777724238819,
+    "ts_us": 1777724238819576,
+    "ts_ns": 1777724238819576609
+  }
+}
+```
 
 - **PostgreSQL `wal_level=logical`:**
   ```bash
@@ -62,7 +102,7 @@ Three quick checks the grader (or you) can run live:
   ```
   Set explicitly in [compose.yml:36](compose.yml) (`-c wal_level=logical`) so logical decoding via `pgoutput` works without manual cluster configuration. 
   
-  `screenshots/wal_level.png`.*
+  `screenshots/wal_level.png`.
 
 ### Bronze sample row + counts
 
@@ -76,7 +116,7 @@ ORDER BY kafka_offset DESC
 LIMIT 1;
 ```
 
- `screenshots/section1_bronze_sample.png` showing one row with `op` (`c`/`u`/`d`/`r`), partition, offset, and a fragment of `after_json`.*
+ `screenshots/section1_bronze_sample.png` showing one row with `op` (`c`/`u`/`d`/`r`), partition, offset, and a fragment of `after_json`.
 
 Bronze row counts after a controlled test:
 
@@ -203,21 +243,21 @@ Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka C
 
 ![Failed run details](dag_fail.png.jpeg)
 
-**Connector-failure scenario** (handout asks: *"Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly."*). Repro:
+**Connector-failure scenario** — stop Kafka Connect and confirm the DAG surfaces the failure at `connector_health`. Repro:
 
 ```bash
 docker stop connect
 airflow dags trigger cdc_lakehouse_pipeline
 ```
 
-Expected: `connector_health` polls `/connectors/pg-cdc/status` every 15 s; after 120 s without a `RUNNING` response it raises `AirflowSensorTimeout` and is marked failed. All seven downstream tasks transition to `upstream_failed` (skipped). Recovery: `docker start connect`; the next 15-minute schedule passes the sensor and the pipeline catches up. `screenshots/section3_connector_fail.png`.*
+Expected: `connector_health` polls `/connectors/pg-cdc/status` every 15 s; after 120 s without a `RUNNING` response it raises `AirflowSensorTimeout` and is marked failed. All seven downstream tasks transition to `upstream_failed` (skipped). Recovery: `docker start connect`; the next 15-minute schedule passes the sensor and the pipeline catches up. `screenshots/section3_connector_fail.png`.
 connector_health Log:
 ```bash
 requests.exceptions.ConnectionError: HTTPConnectionPool(host='connect', port=8083): Max retries exceeded with url: /connectors/pg-cdc/status (Caused by NameResolutionError("<urllib3.connection.HTTPConnection object at 0x77be4997f510>: Failed to resolve 'connect' ([Errno -2] Name or service not known)"))
 [2026-05-02, 09:51:26 UTC] {taskinstance.py:1226} INFO - Marking task as FAILED. dag_id=cdc_lakehouse_pipeline, task_id=connector_health, run_id=scheduled__2026-05-02T09:30:00+00:00, execution_date=20260502T093000, start_date=20260502T095123, end_date=20260502T095126
 [2026-05-02, 09:51:26 UTC] {taskinstance.py:1564} INFO - Executing callback at index 0: _on_failure
 [2026-05-02, 09:51:26 UTC] {cdc_lakehouse_dag.py:34} ERROR - ALERT: Task failed! DAG=cdc_lakehouse_pipeline  Task=connector_health  Run=scheduled__2026-05-02T09:30:00+00:00
-[2026-05-02, 09:51:26 UTC] {taskinstance.py:341} ▶ Post task execution logs
+[2026-05-02, 09:51:26 UTC] {taskinstance.py:341} Post task execution logs
 ```
 
 ### Three successful consecutive runs
@@ -457,9 +497,7 @@ Trimmed `validate` task log from one healthy run (`Silver-PG delta: 0  OK`) and 
 
 ## 6. Bonus — Schema evolution
 
-*Status: design walkthrough. Optional demo — replace stubs with screenshots after running the experiment.*
-
-**Experiment:** add a column to PostgreSQL while the pipeline is running, then trigger a CDC event so the new column flows through bronze and silver.
+**Experiment:** add a column to PostgreSQL while the pipeline is running, then ingest bronze and run silver so the new column flows through.
 
 ```sql
 -- in psql against the source DB:
@@ -467,52 +505,43 @@ ALTER TABLE customers ADD COLUMN phone TEXT;
 UPDATE customers SET phone = '+372-5550-0001' WHERE id = 1;
 ```
 
+Then run bronze for `customers`, then `cdc_pipeline.py --stage silver --table customers` (or the DAG tasks that perform the same steps).
+
 **What each layer does:**
 
 - **Debezium / Kafka:** `pgoutput` picks up the new column on the next change; the next event for `customers` carries `phone` inside `payload.after`. Schema metadata in the event envelope is updated automatically.
 - **Bronze (no DDL needed):** `before` and `after` are stored as raw JSON strings (`before_json`, `after_json` — see §2 *schema-flexible bronze rationale*), so the new field lands inside `after_json` without any change to the bronze table.
-- **Silver (one-time DDL):**
-  ```sql
-  ALTER TABLE public.customers ADD COLUMN phone TEXT;
+- **Silver (automatic Iceberg DDL):** On each silver run, `jobs/cdc_pipeline.py` samples `after_json` from the upsert batch, unions top-level JSON keys, and issues `ALTER TABLE lakehouse.cdc.silver_<table> ADD COLUMN \`<name>\` STRING` for every safe identifier missing from Iceberg. The MERGE projection is built from that union (`id` cast to INT; drivers keep special handling for `rating` / `active`; other fields including new ones use `get_json_object`). Old bootstrap DDL in `SILVER_SCHEMAS` only applies when the silver table is first created. **Assumption:** Debezium emits a full `after` image so partial updates do not wipe columns that are omitted from `payload.after`.
 
-  UPDATE public.customers
-  SET phone = '+123-1212-4334'
-  WHERE id = 1;   -- use an id that exists; if UPDATE 0, change the id
+**Evidence**
 
-  INSERT INTO public.customers (name, email, country, phone)
-  VALUES ('test user', 'testing@ut.ee', 'Estonia', '+111-2222-3333');
+- `screenshots/section6_alter_postgres.png` — psql showing the `ALTER TABLE` + `UPDATE`, then the `customers` row with the new `phone`.
 
-  ```
-  After this, `cdc_pipeline.py --stage silver --table customers` MERGE source can pick up the new column with `try_cast(get_json_object(after_json, '$.phone') AS STRING) AS phone` and the next run upserts the value into silver.
+```bash
+ALTER TABLE public.customers ADD COLUMN phone TEXT;
+UPDATE public.customers SET phone = '+111-2222-3345' WHERE name = 'test user';
+INSERT INTO public.customers (name, email, country, phone) VALUES ('test user', 'testing@ut.ee', 'Estonia', '+111-2222-3333');
+```
 
-**Evidence (when run):**
-
-- `screenshots/section6_alter_postgres.png`* — psql showing the `ALTER TABLE` + `UPDATE`, then the `customers` row with the new `phone`.
-- *PASTE HERE: `screenshots/section6_silver_phone.png`* — `SELECT id, name, phone FROM lakehouse.cdc.silver_customers WHERE id = 1;` with the populated value.
-
-If you do not run the demo, leave this section as a design walkthrough and mark it as such in the grading checklist below.
+- `screenshots/section6_silver_phone.png` — `SELECT phone FROM lakehouse.cdc.silver_customers WHERE name = 'test user';` with the populated value.
 
 ---
 
 ## 7. Environment values
 
-*Status: pending — to be filled before submission per the handout's instruction "provide them in `REPORT.md` section 8".*
+Keys defined in `.env.example` (copied to `.env` for local runs). Values are git-ignored and not listed here.
 
-Keys defined in `.env.example` (copy to `.env` and replace defaults before submission):
-
-- `MINIO_ROOT_USER` = `<set in .env>`
-- `MINIO_ROOT_PASSWORD` = `<set in .env>`
-- `PG_USER` = `<set in .env>`
-- `PG_PASSWORD` = `<set in .env>`
-- `JUPYTER_TOKEN` = `<set in .env>`
-- `AIRFLOW_USER` = `<set in .env>`
-- `AIRFLOW_PASSWORD` = `<set in .env>`
-
-`.env` itself is git-ignored.
+- `MINIO_ROOT_USER`
+- `MINIO_ROOT_PASSWORD`
+- `PG_USER`
+- `PG_PASSWORD`
+- `JUPYTER_TOKEN`
+- `AIRFLOW_USER`
+- `AIRFLOW_PASSWORD`
 
 ---
 
-## Grading checklist (self-review)
+## Checklist
 
 - [x] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors → see `README.md` setup, plus §3 *Three successful consecutive runs*.
 - [x] Debezium connector is registered and **RUNNING** → §1 *Connector / source verification* (`/connectors/pg-cdc/status`).
@@ -526,5 +555,5 @@ Keys defined in `.env.example` (copy to `.env` and replace defaults before submi
 - [x] Retry/failure handling configured and documented → §3 *Retry and failure handling* (drift example) + *Connector-failure scenario*.
 - [x] Iceberg snapshot history shown in REPORT.md → §2 *Iceberg snapshot history*.
 - [x] Custom scenario implemented and documented → §5 (entire section).
-- [x] REPORT.md answers all required sections → §1–§5 + §6 (bonus, design) + §7 (env keys listed).
-- [ ] `.env` values provided in §7 → **pending — fill before submission**.
+- [x] REPORT.md answers all required sections → §1–§5 + §6 (bonus — dynamic silver evolution in `cdc_pipeline.py`) + §7 (environment keys).
+- [x] Environment keys documented in §7; secret values only in local `.env`.

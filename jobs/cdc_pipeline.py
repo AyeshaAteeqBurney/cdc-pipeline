@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-CDC path: one entrypoint for the group, aligned with Airflow task names (bronze_cdc, silver_cdc, …).
+CDC entrypoint aligned with Airflow task names (bronze_cdc, silver_cdc, …).
 
 Stages:
   bronze  — append-only raw Debezium events from Kafka → Iceberg (schema-flexible JSON columns).
-  silver  — add a ``--stage silver`` branch here when implementing the DAG’s ``silver_cdc`` task (MERGE).
+  silver  — MERGE into silver Iceberg tables (dynamic column discovery; see ``run_silver``).
 
 Run inside the `jupyter` container after the connector is registered (use spark-submit if needed):
   docker exec jupyter spark-submit /home/jovyan/project/jobs/cdc_pipeline.py --stage bronze --table customers
@@ -14,13 +14,15 @@ Run inside the `jupyter` container after the connector is registered (use spark-
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from pathlib import Path
 
 import pyspark.sql.functions as F
 from pyspark.sql import Window
-from pyspark.sql.types import LongType, IntegerType, DoubleType, BooleanType
+from pyspark.sql.types import LongType, IntegerType, BooleanType
 
 # Ensure `/home/jovyan/project` is on sys.path when run by absolute path.
 PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
@@ -103,6 +105,9 @@ def run_bronze(
     print(f"Wrote {out.count()} rows to {target} from topic {topic}")
 
 
+# Bootstrap DDL for brand-new clusters (CREATE TABLE IF NOT EXISTS). Silver still evolves:
+# any top-level key present in Debezium ``after`` JSON but missing from Iceberg gets
+# ``ALTER TABLE ... ADD COLUMN <name> STRING`` at silver runtime (see ``_evolve_silver_schema``).
 SILVER_SCHEMAS = {
     "customers": """
         id         INT,
@@ -122,6 +127,69 @@ SILVER_SCHEMAS = {
     """,
 }
 
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_safe_sql_identifier(name: str) -> bool:
+    return bool(_SAFE_IDENT.match(name))
+
+
+def _discover_top_level_keys_from_upserts(upserts_df, *, max_samples: int = 8000) -> set[str]:
+    """Union of top-level keys observed in ``after_json`` for this micro-batch."""
+    keys: set[str] = set()
+    for row in upserts_df.select("after_json").limit(max_samples).collect():
+        raw = row.after_json
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            keys.update(obj.keys())
+    return keys
+
+
+def _silver_column_names(spark, silver_tgt: str) -> set[str]:
+    return set(spark.table(silver_tgt).columns)
+
+
+def _ordered_silver_columns(keys_from_json: set[str], existing_table_cols: set[str]) -> list[str]:
+    """Merge JSON keys with existing Iceberg columns; stable order with ``id`` first."""
+    return sorted(
+        existing_table_cols | keys_from_json,
+        key=lambda c: (0 if c == "id" else 1, c),
+    )
+
+
+def _evolve_silver_schema(spark, silver_tgt: str, keys_from_json: set[str]) -> None:
+    """ADD COLUMN for every JSON key not yet present on the Iceberg silver table (new cols as STRING)."""
+    existing = _silver_column_names(spark, silver_tgt)
+    missing = keys_from_json - existing
+    for col in sorted(missing):
+        if not _is_safe_sql_identifier(col):
+            print(f"Schema evolution: skip unsafe column name {col!r}")
+            continue
+        spark.sql(f"ALTER TABLE {silver_tgt} ADD COLUMN `{col}` STRING")
+        print(f"Schema evolution: ALTER TABLE {silver_tgt} ADD COLUMN `{col}` STRING")
+
+
+def _projection_column(col: str, table: str):
+    """One Spark column expr from ``after_json``; unknown/new columns are STRING."""
+    path = f"$.{col}"
+    if col == "id":
+        return F.get_json_object("after_json", path).cast(IntegerType()).alias(col)
+    if table == "drivers" and col == "rating":
+        return F.expr("try_cast(get_json_object(after_json, '$.rating') as DOUBLE)").alias(col)
+    if table == "drivers" and col == "active":
+        return F.get_json_object("after_json", path).cast(BooleanType()).alias(col)
+    return F.get_json_object("after_json", path).alias(col)
+
+
+def _build_upsert_projection(upserts_df, table: str, columns: list[str]):
+    exprs = [_projection_column(c, table) for c in columns]
+    return upserts_df.select(*exprs)
+
 
 def _ensure_silver_table(spark, table: str) -> str:
     tgt = f"lakehouse.cdc.silver_{table}"
@@ -132,29 +200,6 @@ def _ensure_silver_table(spark, table: str) -> str:
         USING iceberg
     """)
     return tgt
-
-
-def _parse_upsert_fields(df, table: str):
-    if table == "customers":
-        return df.select(
-            F.get_json_object("after_json", "$.id").cast(IntegerType()).alias("id"),
-            F.get_json_object("after_json", "$.name").alias("name"),
-            F.get_json_object("after_json", "$.email").alias("email"),
-            F.get_json_object("after_json", "$.country").alias("country"),
-            F.get_json_object("after_json", "$.created_at").alias("created_at"),
-        )
-    else:
-        return df.select(
-            F.get_json_object("after_json", "$.id").cast(IntegerType()).alias("id"),
-            F.get_json_object("after_json", "$.name").alias("name"),
-            F.get_json_object("after_json", "$.license_number").alias("license_number"),
-            # Debezium encodes DECIMAL as base64 binary via JsonConverter.
-            # try_cast returns NULL instead of failing on those values.
-            F.expr("try_cast(get_json_object(after_json, '$.rating') as DOUBLE)").alias("rating"),
-            F.get_json_object("after_json", "$.city").alias("city"),
-            F.get_json_object("after_json", "$.active").cast(BooleanType()).alias("active"),
-            F.get_json_object("after_json", "$.created_at").alias("created_at"),
-        )
 
 
 def _get_silver_watermark(spark, table: str) -> dict:
@@ -238,9 +283,17 @@ def run_silver(spark, *, table: str) -> None:
     upserts = latest.filter(F.col("op").isin("c", "u", "r"))
     deletes = latest.filter(F.col("op") == "d")
 
-    # Apply upserts to silver.
+    # Apply upserts to silver (dynamic schema: JSON keys → Iceberg columns).
     if upserts.count() > 0:
-        upsert_df = _parse_upsert_fields(upserts, table)
+        keys_from_json = _discover_top_level_keys_from_upserts(upserts)
+        safe_keys = {k for k in keys_from_json if _is_safe_sql_identifier(k)}
+        if "id" not in safe_keys:
+            raise ValueError("Silver upsert batch has no `id` in after_json — cannot MERGE.")
+        _evolve_silver_schema(spark, silver_tgt, safe_keys)
+        existing_cols = _silver_column_names(spark, silver_tgt)
+        merge_cols = _ordered_silver_columns(safe_keys, existing_cols)
+        print(f"Silver MERGE columns ({len(merge_cols)}): {merge_cols}")
+        upsert_df = _build_upsert_projection(upserts, table, merge_cols)
         # Recreate from collected rows to break Iceberg lineage before MERGE.
         upsert_local = spark.createDataFrame(upsert_df.collect(), upsert_df.schema)
         upsert_local.createOrReplaceTempView("silver_upserts")

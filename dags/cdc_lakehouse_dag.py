@@ -7,7 +7,7 @@ Orchestrates both data paths end-to-end on a 15-minute schedule:
   Path B (Taxi): Kafka → Bronze → Silver → Gold
 
 Schedule: every 15 minutes  → supports a 15-minute freshness SLA.
-Phased layers (course README): all bronze tasks must finish before any silver
+Phased layers: all bronze tasks must finish before any silver
 task starts; each silver task depends on all three bronze tasks.
 
 Idempotent: Silver CDC uses Kafka-offset watermarks; re-running with no new
