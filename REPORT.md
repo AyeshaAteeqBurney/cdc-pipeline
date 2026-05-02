@@ -204,7 +204,7 @@ DAG file: `dags/cdc_lakehouse_dag.py`.
 
 | Setting | Value | Reason |
 |---|---|---|
-| `schedule_interval` | `*/15 * * * *` | 15-minute freshness SLA — balances latency against Spark startup overhead (~30 s per task) |
+| `schedule_interval` | `*/15 * * * *` | 15-minute freshness SLA — balances latency against Spark startup overhead (about 30 s per task) |
 | `max_active_runs` | `1` | Prevents overlapping runs that would cause silver MERGE conflicts |
 | `catchup` | `False` | On restart, only the most recent interval runs — avoids flooding with historical backfill |
 | `dagrun_timeout` | `1 hour` | DAG is killed if tasks stall (e.g. Spark hangs) |
@@ -221,27 +221,27 @@ connector_health (HttpSensor → debezium_connect)
 ```
 
 - **`connector_health`** is an `HttpSensor` (`airflow.providers.http.sensors.http.HttpSensor`) that polls `/connectors/pg-cdc/status` on the `debezium_connect` HTTP connection (auto-provisioned via `AIRFLOW_CONN_DEBEZIUM_CONNECT=http://connect:8083` in `compose.yml` — no manual UI step). The `response_check` lambda asserts both `connector.state == "RUNNING"` and every `tasks[*].state == "RUNNING"`. `mode="reschedule"`, `poke_interval=15s`, `timeout=120s` — a stalled connector frees the worker between pokes and ultimately fails the DAG, so every downstream task is skipped via `upstream_failed`.
-- **Phased bronze → silver:** the three bronze tasks run in parallel; **each** silver task lists **all three** bronzes as upstream, matching the course README diagram (`[bronze_cdc, bronze_taxi] → [silver_cdc, silver_taxi]`).
+- **Phased bronze → silver:** the three bronze tasks run in parallel; **each** of `silver_cdc_customers`, `silver_cdc_drivers`, and `silver_taxi` lists **all three** bronzes as upstream (see diagram above).
 - **`gold_taxi`** lists **all three** silver tasks as upstream; **`validate`** lists **`gold_taxi` only** — aligned with `… → gold_taxi → validation`.
 - **`validate`** (`jobs/health_pipeline.py`) compares `silver_customers + silver_drivers` row counts against live PostgreSQL counts. It writes one row to `lakehouse.cdc.gold_pipeline_health` and exits with code 1 if `silver_pg_delta ≠ 0`. (It does not assert taxi tables; wiring it after `gold_taxi` only enforces full-pipeline ordering.)
 
 ### DAG graph — successful run
 
-![DAG graph all green](dag_graph_success.png.jpeg)
+![DAG graph all green](screenshots\dag_graph_success.png)
 
-*`manual_catchup_run_1` — all 9 tasks green. Run duration: ~4 minutes.*
+*`manual_catchup_run_1` — all 9 tasks green. Run duration: 00:03:14 minutes.*
 
 ### Scheduling strategy
 
-A 15-minute interval means silver CDC lags PostgreSQL by at most 15 minutes plus task execution time (~2 minutes), for a worst-case freshness of ~17 minutes. This is acceptable for a near-real-time analytics lakehouse. For stricter SLAs the interval could be reduced to 5 minutes; below that the Spark JVM startup cost (~30 s) becomes a significant fraction of total runtime.
+A 15-minute interval means silver CDC lags PostgreSQL by at most 15 minutes plus task execution time (about 2 minutes), for a worst-case freshness of about 17 minutes. This is acceptable for a near-real-time analytics lakehouse. For stricter SLAs the interval could be reduced to 5 minutes; below that the Spark JVM startup cost (about 30 s) becomes a significant fraction of total runtime.
 
 ### Retry and failure handling
 
 Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka Connect down), the sensor times out and all downstream tasks are skipped via `upstream_failed`. If a silver MERGE fails, `validate` does not run.
 
-**Example failed run** — `scheduled__2026-04-26T17:45:00`: `simulate.py` was left running during this interval, continuously inserting rows into PostgreSQL between the time silver tasks completed and when `validate` ran. Silver had processed 32 rows but PostgreSQL had grown to 91 rows by validate time, producing `silver_pg_delta = -59`. Airflow retried `validate` twice (both failed), then marked the run failed. The following run (`manual_catchup_run_1`) caught up all outstanding Kafka events and `validate` passed with `silver_pg_delta = 0`.
+**Example failed `validate`** — `scheduled__2026-05-01T21:15:00+00:00`: while the OLTP workload was still changing faster than the scheduled DAG could fully catch up, silver row counts lagged live PostgreSQL at the moment `health_pipeline.py` ran. The task logged `Silver-PG delta: -47  DRIFT DETECTED`, `VALIDATE FAILED: silver_pg_delta=-47`, exit code 1; Airflow marked `validate` failed and ran the `on_failure` callback. A later run after catching up Kafka/bronze/silver returned `silver_pg_delta = 0`.
 
-![Failed run details](dag_fail.png.jpeg)
+![Airflow Graph — `validate` failed for drift](screenshots\dag_fail.png)
 
 **Connector-failure scenario** — stop Kafka Connect and confirm the DAG surfaces the failure at `connector_health`. Repro:
 
@@ -251,7 +251,9 @@ airflow dags trigger cdc_lakehouse_pipeline
 ```
 
 Expected: `connector_health` polls `/connectors/pg-cdc/status` every 15 s; after 120 s without a `RUNNING` response it raises `AirflowSensorTimeout` and is marked failed. All seven downstream tasks transition to `upstream_failed` (skipped). Recovery: `docker start connect`; the next 15-minute schedule passes the sensor and the pipeline catches up. `screenshots/section3_connector_fail.png`.
-connector_health Log:
+
+**connector_health** log excerpt:
+
 ```bash
 requests.exceptions.ConnectionError: HTTPConnectionPool(host='connect', port=8083): Max retries exceeded with url: /connectors/pg-cdc/status (Caused by NameResolutionError("<urllib3.connection.HTTPConnection object at 0x77be4997f510>: Failed to resolve 'connect' ([Errno -2] Name or service not known)"))
 [2026-05-02, 09:51:26 UTC] {taskinstance.py:1226} INFO - Marking task as FAILED. dag_id=cdc_lakehouse_pipeline, task_id=connector_health, run_id=scheduled__2026-05-02T09:30:00+00:00, execution_date=20260502T093000, start_date=20260502T095123, end_date=20260502T095126
@@ -260,15 +262,19 @@ requests.exceptions.ConnectionError: HTTPConnectionPool(host='connect', port=808
 [2026-05-02, 09:51:26 UTC] {taskinstance.py:341} Post task execution logs
 ```
 
-### Three successful consecutive runs
+### Successful consecutive scheduled runs
+
+Five scheduled runs on **2026-05-01** (logical times 20:00–21:00 UTC) completed end-to-end with `validate` success. The next interval (**21:15** logical) failed at `validate` with drift (`silver_pg_delta = -47`); see *Example failed `validate`* above.
 
 | Run ID | Type | Start (UTC) | Duration | validate |
 |---|---|---|---|---|
-| `manual_clean_run_2` | manual | 2026-04-26 17:54:05 | 04:42 | success |
-| `manual_catchup_run_1` | manual | 2026-04-26 18:08:30 | 04:06 | success |
-| `scheduled__2026-04-26T18:00:00` | scheduled | 2026-04-26 18:15:01 | 03:50 | success |
+| `scheduled__2026-05-01T20:00:00+00:00` | scheduled | 2026-05-01 20:18:21 | 04:10 | success |
+| `scheduled__2026-05-01T20:15:00+00:00` | scheduled | 2026-05-01 20:36:24 | 03:23 | success |
+| `scheduled__2026-05-01T20:30:00+00:00` | scheduled | 2026-05-01 20:45:01 | 03:15 | success |
+| `scheduled__2026-05-01T20:45:00+00:00` | scheduled | 2026-05-01 21:00:01 | 03:12 | success |
+| `scheduled__2026-05-01T21:00:00+00:00` | scheduled | 2026-05-01 21:15:01 | 03:46 | success |
 
-![Scheduled run success](dag_success.png.jpeg)
+![Airflow DAG Runs — five successes (highlighted in UI)](screenshots\dag_success.png)
 
 ### Backfill
 
@@ -543,7 +549,7 @@ Keys defined in `.env.example` (copied to `.env` for local runs). Values are git
 
 ## Checklist
 
-- [x] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors → see `README.md` setup, plus §3 *Three successful consecutive runs*.
+- [x] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors → see `README.md` setup, plus §3 *Successful consecutive scheduled runs*.
 - [x] Debezium connector is registered and **RUNNING** → §1 *Connector / source verification* (`/connectors/pg-cdc/status`).
 - [x] Bronze CDC table contains raw Debezium events with correct `op`, `before`, `after` fields → §1 *Bronze sample row + counts*, §2 schema row for `bronze_*_flex`.
 - [x] Silver CDC table matches PostgreSQL source (row count + spot check) → §1 *Silver mirrors PostgreSQL*.
@@ -551,7 +557,7 @@ Keys defined in `.env.example` (copied to `.env` for local runs). Values are git
 - [x] Running the DAG twice produces the same silver state (idempotent) → §1 *Idempotency confirmed*; §3 *Backfill*.
 - [x] Taxi bronze/silver/gold tables are correct (improved from Project 2) → §4.
 - [x] Airflow DAG is visible in the UI with correct task dependencies → §3 *Task dependency chain* + DAG graph image.
-- [x] At least 3 successful DAG runs shown → §3 *Three successful consecutive runs*.
+- [x] At least 3 successful DAG runs shown → §3 *Successful consecutive scheduled runs* (five listed).
 - [x] Retry/failure handling configured and documented → §3 *Retry and failure handling* (drift example) + *Connector-failure scenario*.
 - [x] Iceberg snapshot history shown in REPORT.md → §2 *Iceberg snapshot history*.
 - [x] Custom scenario implemented and documented → §5 (entire section).
