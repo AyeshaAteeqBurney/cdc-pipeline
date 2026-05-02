@@ -77,6 +77,7 @@ You should see these services running:
 | `kafka` | Message broker (KRaft, no ZooKeeper) |
 | `postgres` | OLTP source database for CDC |
 | `connect` | Kafka Connect with Debezium PostgreSQL connector |
+| `connector_init` | One-shot connector registration (exited is OK) |
 | `minio` | S3-compatible object storage for Iceberg |
 | `minio_init` | One-shot bucket creation (exited is OK) |
 | `iceberg-rest` | Iceberg REST catalog |
@@ -99,17 +100,35 @@ pg_execute("SELECT * FROM customers ORDER BY id;", fetch=True)
 ### 6. Start the taxi producer (same as Project 2)
 
 ```bash
-docker exec jupyter python /home/jovyan/project/produce.py --loop
+docker exec -it jupyter python /home/jovyan/project/produce.py --loop
 ```
 
 ### 7. Start the change simulator
 
 ```bash
-docker exec jupyter python /home/jovyan/project/simulate.py
+docker exec -it jupyter python /home/jovyan/project/simulate.py
 ```
 
 This continuously makes random inserts, updates, and deletes to the PostgreSQL
 source tables, simulating a live application.
+
+> **Stopping cleanly (important).** Always pass `-it` so that Ctrl-C in your
+> terminal forwards `SIGINT` to the Python process inside the container.
+> Without `-it`, Ctrl-C only kills the local `docker exec` client — the
+> simulator/producer keeps running as an orphan inside `jupyter`, which makes
+> validate fail later because Postgres keeps changing while the DAG runs.
+>
+> Verify nothing is left over before triggering a DAG validation run:
+>
+> ```bash
+> docker exec jupyter sh -c "ps -ef | grep -E 'simulate|produce' | grep -v grep || echo clean"
+> ```
+>
+> If anything shows up, kill it:
+>
+> ```bash
+> docker exec jupyter sh -c "pkill -f simulate.py; pkill -f produce.py" || true
+> ```
 
 ### 8. Open services
 
@@ -137,13 +156,26 @@ Steps **1–7** above (`.env`, `compose up`, data under `data/`, **seed**, **pro
 
 ### Debezium connector
 
-From the **repository root** on the host (Python 3; uses only the standard library):
+Connector registration is now automatic in Compose via the one-shot `connector-init`
+service (it runs after `connect` is healthy, then exits).
+
+If you need to run it manually, use one of these commands:
 
 ```bash
+# host
 python scripts/register_debezium_connector.py --connect-url http://localhost:8083
+
+# from jupyter container with absolute config path
+docker exec jupyter python /home/jovyan/project/scripts/register_debezium_connector.py \
+  --connect-url http://connect:8083 \
+  --config /home/jovyan/project/config/debezium-postgres-connector.json
 ```
 
-This loads `config/debezium-postgres-connector.json`. Confirm the connector is **RUNNING**, e.g. open `http://localhost:8083/connectors` or check the Connect logs.
+Why manual runs can fail with `Connector config not found`: the script's default config
+path is relative (`config/debezium-postgres-connector.json`), so running from a different
+working directory inside a container may not resolve that file.
+
+Confirm the connector is **RUNNING**, e.g. open `http://localhost:8083/connectors` or check the Connect logs.
 
 ### CDC Bronze → Iceberg (`jobs/cdc_pipeline.py`)
 
@@ -158,7 +190,9 @@ Iceberg tables: `lakehouse.cdc.bronze_customers_flex`, `lakehouse.cdc.bronze_dri
 
 ### Taxi medallion (`jobs/taxi_pipeline.py`)
 
-**Bronze** and **Silver** are long-running streaming jobs; **Gold** is a batch job that exits.
+**Bronze** can run continuously (streaming) or one-shot (`--once`) for Airflow.  
+**Silver** is incremental and idempotent via a per-partition Kafka offset watermark (`lakehouse.taxi.silver_watermark`) and supports both continuous and one-shot modes.  
+**Gold** is a batch aggregation job that exits.
 
 ```bash
 # Use separate terminals if running bronze + silver together.
@@ -171,7 +205,7 @@ If `spark-submit` is not needed in your image, `docker exec jupyter python /home
 
 ### Airflow
 
-Place DAG files under `dags/` (mounted into the Airflow containers). Orchestration is not wired in the template; the group adds tasks that call the commands above on the chosen schedule.
+Place DAG files under `dags/` (mounted into the Airflow containers). The DAG in this repo checks Debezium health via `CONNECT_URL` directly (no manual Airflow HTTP connection object required), then orchestrates CDC + taxi tasks on schedule.
 
 ---
 

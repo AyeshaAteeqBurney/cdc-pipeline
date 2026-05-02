@@ -7,6 +7,9 @@ Orchestrates both data paths end-to-end on a 15-minute schedule:
   Path B (Taxi): Kafka → Bronze → Silver → Gold
 
 Schedule: every 15 minutes  → supports a 15-minute freshness SLA.
+Phased layers (course README): all bronze tasks must finish before any silver
+task starts; each silver task depends on all three bronze tasks.
+
 Idempotent: Silver CDC uses Kafka-offset watermarks; re-running with no new
 bronze events is a no-op. Bronze taxi uses Spark streaming checkpoints.
 Gold overwrites partitions — same input always produces same output.
@@ -179,6 +182,7 @@ with DAG(
     # Runs health_pipeline.py which compares silver CDC row counts against
     # live PostgreSQL counts. Exits with code 1 if silver_pg_delta != 0,
     # causing this task to fail and trigger its retries / alert.
+    # Runs after gold_taxi only; gold_taxi waits on all silvers (CDC + taxi).
     validate = BashOperator(
         task_id="validate",
         bash_command=(
@@ -187,16 +191,21 @@ with DAG(
         ),
     )
 
-    # ── Dependency chain ────────────────────────────────────────────────────
+    # ── Dependency chain (phased bronze → silver) ───────────────────────────
     #
     #  connector_health
     #       │
-    #       ├── bronze_cdc_customers ──► silver_cdc_customers ──┐
-    #       ├── bronze_cdc_drivers   ──► silver_cdc_drivers   ──┼──► validate
-    #       └── bronze_taxi ──► silver_taxi ──► gold_taxi
+    #       ├── bronze_cdc_customers ──┐
+    #       ├── bronze_cdc_drivers   ──┼── ALL bronze done ──► [silver_cdc_* , silver_taxi]
+    #       └── bronze_taxi ───────────┘                              │
+    #                                           silver_cdc_* + silver_taxi ──► gold_taxi ──► validate
     #
-    connector_health >> [bronze_cdc_customers, bronze_cdc_drivers, bronze_taxi]
-    bronze_cdc_customers >> silver_cdc_customers
-    bronze_cdc_drivers >> silver_cdc_drivers
-    [silver_cdc_customers, silver_cdc_drivers] >> validate
-    bronze_taxi >> silver_taxi >> gold_taxi
+    _bronze = [bronze_cdc_customers, bronze_cdc_drivers, bronze_taxi]
+
+    connector_health >> _bronze
+    _bronze >> silver_cdc_customers
+    _bronze >> silver_cdc_drivers
+    _bronze >> silver_taxi
+
+    silver_taxi >> gold_taxi
+    [silver_cdc_customers, silver_cdc_drivers] >> gold_taxi >> validate

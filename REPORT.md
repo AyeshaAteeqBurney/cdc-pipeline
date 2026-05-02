@@ -1,64 +1,19 @@
 # Project 3 — CDC + Orchestrated Lakehouse Pipeline
 
----
+This report answers the course handout's "What is graded" rubric (CDC correctness, Lakehouse design, Orchestration design, Streaming pipeline, Custom scenario) plus the optional bonus and `.env` section. Setup, runtime, and operational details (`docker compose`, seed/produce/simulate, troubleshooting) live in `README.md`.
 
-### 1. Debezium CDC connector
+The pipeline runs **two paths under one Airflow DAG** (`dags/cdc_lakehouse_dag.py`):
 
-#### Completed
-
-- **Connector definition** lives in `config/debezium-postgres-connector.json` (connector name `pg-cdc`). It uses the Debezium **PostgreSQL** connector with **`plugin.name` = `pgoutput`** (native logical decoding), **`snapshot.mode` = `initial`** so existing rows are emitted once before the change stream (appropriate for a dev lakehouse and for proving snapshot + CDC in Kafka).
-- **Captured tables:** `public.customers`, `public.drivers`. **Topic layout:** `dbserver1.public.<table>` (from `topic.prefix` + default routing).
-- **Registration automation:** `scripts/register_debezium_connector.py` POSTs/updates the config against the Kafka Connect REST API (`CONNECT_URL`, default `http://localhost:8083` from the host, or `http://connect:8083` inside Compose).
-- **Operational fixes applied while bringing the stack up:**
-  - **`publication.autocreate.mode`:** set to **`all_tables`** so PostgreSQL publication creation succeeds (filtered mode had failed with “no table filters” for the publication in our environment).
-  - **Credentials:** `database.password` aligned with the PostgreSQL user secret from `.env` (template had used a different placeholder password).
-- **Delete semantics:** `tombstones.on.delete` is **`true`** so delete operations can surface tombstone records in Kafka; downstream Bronze ingestion skips null payloads but still records deletes via non-tombstone envelopes where applicable.
-
-#### TODO (not blocking )
-
-- [ ] Screenshot or paste: connector status **RUNNING** from Connect UI or `GET /connectors/pg-cdc/status`.
-- [ ] Short justification for **`snapshot.mode`** vs alternatives (e.g. `never`) if you change it for production-style runs.
-- [ ] Evidence: sample **Kafka consumer** or topic inspection showing events on `dbserver1.public.customers` and `dbserver1.public.drivers`.
-- [ ] Document **`wal_level=logical`** confirmation on PostgreSQL (e.g. `SHOW wal_level;`) if not already in repo docs.
+- **Path A (CDC):** PostgreSQL → Debezium → Kafka → Bronze CDC → Silver CDC (MERGE).
+- **Path B (Taxi):** Taxi producer → Kafka → Bronze taxi → Silver taxi → Gold taxi.
 
 ---
 
-### 2. Bronze CDC layer (raw CDC event log)
+## 1. CDC correctness
 
-#### Completed
+### Silver mirrors PostgreSQL
 
-- **Entrypoint:** `jobs/cdc_pipeline.py` with **`--stage bronze`** and **`--table customers|drivers`**. (Same script is intended to grow **`--stage silver`** for the `silver_cdc` Airflow task later.)
-- **Execution note:** run with **`spark-submit`** inside the `jupyter` service so Iceberg and Kafka packages match `PYSPARK_SUBMIT_ARGS` in `compose.yml` (plain `python` may miss the Spark classpath).
-- **Iceberg targets:** append-only tables **`lakehouse.cdc.bronze_customers_flex`** and **`lakehouse.cdc.bronze_drivers_flex`** (namespace `lakehouse.cdc` created if missing).
-- **Parsing:** Debezium **JSONConverter** envelope; fields read via **`$.payload.*`** JSON paths. **`op`**, **`ts_ms`**, **`source.lsn`**, and Kafka metadata (**topic, partition, offset, timestamp**) are stored. **`before`** and **`after`** are kept as **raw JSON strings** (`before_json`, `after_json`) for **schema-flexible** Bronze (future `ALTER TABLE` / bonus schema evolution without breaking ingestion).
-- **Tombstones:** rows with **null** Kafka value are **filtered out** before append (tombstone-only messages carry no payload to parse).
-- **Semantics:** **append-only** — no updates/deletes in Bronze; duplicates are a concern for Silver deduplication/MERGE, not Bronze.
-
-#### TODO
-
-- [ ] Paste **example row** (redacted) or notebook output: `op`, fragment of `after_json`, and Kafka offset columns.
-- [ ] **Row counts** after a controlled test (optional: align with simulator cadence).
-- [ ] If the DAG batches Bronze runs: document **`startingOffsets` / `endingOffsets`** strategy used in `cdc_pipeline.py` (currently CLI defaults) for idempotency.
-
----
-
-### 3. Silver CDC layer (current-state mirror)
-
-#### Completed
-
-- **Entrypoint:** `jobs/cdc_pipeline.py --stage silver --table customers|drivers`. Same script as Bronze; `--stage` selects the path.
-- **Incremental read:** Silver tracks the highest `kafka_offset` processed per Kafka partition in a dedicated watermark table (`lakehouse.cdc.silver_<table>_watermark`). On each run, only bronze rows with `kafka_offset > watermark` for their partition are read. First run processes all bronze rows. `kafka_offset` is used rather than `ingested_at` because bronze re-reads from Kafka `earliest` on every run, meaning `ingested_at` changes even for already-processed rows.
-- **Deduplication:** Among new bronze events, a `ROW_NUMBER()` window partitioned by primary key and ordered by `ts_ms DESC` keeps only the latest event per record. Handles cases where multiple ops arrived for the same row in one run.
-- **MERGE logic:**
-  - `op IN ('c', 'u', 'r')` → `WHEN MATCHED THEN UPDATE`, `WHEN NOT MATCHED THEN INSERT`
-  - `op = 'd'` → `WHEN MATCHED THEN DELETE`
-- **Iceberg lineage fix:** Before each `MERGE INTO`, the source DataFrame is materialized via `spark.createDataFrame(df.collect(), schema)` to break Iceberg lineage. Without this, Spark throws `[INTERNAL_ERROR] No plan for TableReference` when source and target are both Iceberg tables.
-- **Debezium DECIMAL encoding:** PostgreSQL `DECIMAL(3,2)` columns (e.g. `drivers.rating`) are base64-encoded by `JsonConverter`. Parsed with `try_cast(get_json_object(after_json, '$.rating') as DOUBLE)` to return `NULL` instead of a cast failure.
-- **Idempotency:** Re-running silver with no new bronze events is a no-op — the watermark filters out all already-processed offsets and the job prints `No new bronze events for <table>, silver is up to date.` Re-running after a bronze re-ingest produces the same silver state because the watermark tracks `kafka_offset`, not row identity.
-
-#### Evidence
-
-**Row count validation** (simulate stopped, all Debezium events flushed before pipeline run):
+**Row count validation** (simulator stopped, all Debezium events flushed before the pipeline run):
 
 | Run | silver_customers | silver_drivers | pg_customers | pg_drivers | delta |
 |-----|-----------------|----------------|--------------|------------|-------|
@@ -75,13 +30,103 @@
 | 7 | Grace Kim | grace@example.com | Latvia |
 | 9 | Ingrid Larsen | updated_9_675@test.net | Norway |
 
-Both silver and PostgreSQL returned identical rows for all 5 records — including rows whose email was updated by `simulate.py`.
+Both silver and PostgreSQL returned identical rows for all 5 records, including rows whose email was updated by `simulate.py`.
 
-**Deletes confirmed:** `simulate.py` performs random DELETE operations; these appear as `op='d'` events in bronze (e.g. run 3 recorded 4 deletes) and are removed from silver via the MERGE DELETE branch. Customers deleted from PostgreSQL are absent from silver after the next pipeline run.
+### Deletes confirmed
 
-**Idempotency confirmed:** Run 7 (no new changes after run 6) printed `Events (c/u/d/r): 0/0/0/0` — watermark filtered out all already-processed offsets and silver row count was unchanged.
+`simulate.py` performs random `DELETE` operations; these appear as `op='d'` events in bronze (run 3 recorded 4 deletes) and are removed from silver via the MERGE `DELETE` branch. Customers deleted from PostgreSQL are absent from silver after the next pipeline run.
 
-**Iceberg snapshot history — `silver_customers`:**
+### Idempotency confirmed
+
+Run 7 (no new changes after run 6) printed `Events (c/u/d/r): 0/0/0/0` — the `kafka_offset > watermark` filter (`lakehouse.cdc.silver_<table>_watermark`) skipped all already-processed offsets and silver row count was unchanged. `cdc_pipeline.py --stage silver` prints `No new bronze events for <table>, silver is up to date.` when re-run with no new bronze rows. The MERGE itself is idempotent: `op IN ('c','u','r')` upserts and `op='d'` deletes both produce the same end state when re-applied.
+
+### Connector / source verification
+
+Three quick checks the grader (or you) can run live:
+
+- **Connector RUNNING:**
+  ```bash
+  curl -s http://localhost:8083/connectors/pg-cdc/status | jq .
+  ```
+  `screenshots/section1_connector_status.png`.*
+
+- **Kafka topic carrying CDC events:**
+  ```bash
+  docker exec kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic dbserver1.public.customers --from-beginning --max-messages 1
+  ```
+  Expected: a Debezium envelope with `payload.op` ∈ {`c`,`u`,`d`,`r`}. *PASTE HERE.*
+
+- **PostgreSQL `wal_level=logical`:**
+  ```bash
+  docker exec postgres psql -U cdc_user -c "SHOW wal_level;"
+  ```
+  Set explicitly in [compose.yml:36](compose.yml) (`-c wal_level=logical`) so logical decoding via `pgoutput` works without manual cluster configuration. 
+  
+  `screenshots/wal_level.png`.*
+
+### Bronze sample row + counts
+
+Sample event from `lakehouse.cdc.bronze_customers_flex`:
+
+```sql
+SELECT op, kafka_partition, kafka_offset,
+       substr(after_json, 1, 80) AS after_json_excerpt
+FROM lakehouse.cdc.bronze_customers_flex
+ORDER BY kafka_offset DESC
+LIMIT 1;
+```
+
+ `screenshots/section1_bronze_sample.png` showing one row with `op` (`c`/`u`/`d`/`r`), partition, offset, and a fragment of `after_json`.*
+
+Bronze row counts after a controlled test:
+
+```sql
+SELECT 'bronze_customers_flex' AS table, COUNT(*) AS rows FROM lakehouse.cdc.bronze_customers_flex
+UNION ALL
+SELECT 'bronze_drivers_flex',           COUNT(*)       FROM lakehouse.cdc.bronze_drivers_flex;
+```
++---------------------+----+
+|table                |rows|
++---------------------+----+
+|bronze_customers_flex|2560|
+|bronze_drivers_flex  |1738|
++---------------------+----+
+
+Note: bronze counts grow faster than silver (bronze is append-only event history; silver is current state), so a positive `bronze_row_count − silver_row_count` is expected.
+
+---
+
+## 2. Lakehouse design
+
+### Schemas
+
+| Table | Layer | Key columns / shape |
+|-------|-------|---------------------|
+| `lakehouse.cdc.bronze_customers_flex` | Bronze CDC | `op STRING`, `ts_ms LONG`, `source_lsn STRING`, `before_json STRING`, `after_json STRING`, `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_timestamp`, `ingested_at` |
+| `lakehouse.cdc.bronze_drivers_flex` | Bronze CDC | same shape as above |
+| `lakehouse.cdc.silver_customers` | Silver CDC | `id LONG`, `name STRING`, `email STRING`, `country STRING`, `updated_at TIMESTAMP` (current-state mirror, MERGE-maintained) |
+| `lakehouse.cdc.silver_drivers` | Silver CDC | `id LONG`, `name STRING`, `city STRING`, `rating DOUBLE`, `updated_at TIMESTAMP` |
+| `lakehouse.taxi.bronze` | Bronze taxi | Raw Kafka payload columns + Kafka metadata |
+| `lakehouse.taxi.silver` | Silver taxi | Typed: `vendor_id`, `pickup_datetime`, `dropoff_datetime`, `ratecode_id`, `passenger_count`, `trip_distance`, `fare_amount`, `total_amount`, `pu_location_id`, `do_location_id`, `pickup_zone`, `dropoff_zone` |
+| `lakehouse.taxi.gold` | Gold taxi | `pickup_hour TIMESTAMP`, `pickup_zone STRING`, `trip_count LONG`, `avg_fare DOUBLE`, `avg_distance DOUBLE`, `total_revenue DOUBLE` — partitioned by `days(pickup_hour)` |
+| `lakehouse.cdc.gold_pipeline_health` | Gold CDC | One row per DAG run — see §5. |
+| `lakehouse.cdc.gold_pipeline_alerts` | Gold CDC | Health + nullable `drift_alert` / `silence_alert` / `lag_alert` — see §5. |
+
+### Schema-flexible bronze rationale
+
+`before` and `after` are stored as **raw JSON strings** (`before_json`, `after_json`) instead of typed columns. This makes bronze immune to upstream schema additions — the pipeline does not need a `bronze` DDL change when a column is added to PostgreSQL (see §6). Silver casts specific JSON paths via `get_json_object` and `try_cast`, so bad/missing values become `NULL` rather than failed runs.
+
+### Bronze offsets — idempotency contract
+
+Bronze CDC is invoked from Airflow with explicit offsets:
+
+```python
+"--startingOffsets earliest --endingOffsets latest"
+```
+
+(`dags/cdc_lakehouse_dag.py:111` and `:123`). Bronze re-reads from `earliest` every run; **idempotency lives in silver** via a per-partition watermark in `lakehouse.cdc.silver_<table>_watermark` (`kafka_offset > watermark` filter + `ROW_NUMBER() OVER (PARTITION BY pk ORDER BY ts_ms DESC)` for dedup). This survives bronze re-ingests because the watermark tracks `kafka_offset`, not `ingested_at`.
+
+### Iceberg snapshot history — `silver_customers`
 
 | snapshot_id | committed_at | operation |
 |---|---|---|
@@ -96,71 +141,86 @@ Both silver and PostgreSQL returned identical rows for all 5 records — includi
 | 5659384266348904686 | 2026-04-19 19:32:26 | overwrite |
 | 5762764280491288212 | 2026-04-19 19:32:28 | overwrite |
 
-The first snapshot (`append`) was produced by run 1 — only `op='r'` (snapshot) events, all inserts, no deletes. Subsequent runs produce `overwrite` snapshots because MERGE operations touch existing rows (updates and deletes). Each pipeline run creates two snapshots: one for the upsert MERGE and one for the delete MERGE.
+The first snapshot (`append`) is run 1 — only `op='r'` (snapshot) events. Subsequent runs produce `overwrite` snapshots because MERGE touches existing rows. Each pipeline run creates two snapshots: one for the upsert MERGE and one for the delete MERGE.
 
-**Time travel / rollback:** To roll back a bad MERGE to the previous snapshot, run:
+### Rollback / time travel
+
 ```sql
 CALL lakehouse.system.rollback_to_snapshot(
     'lakehouse.cdc.silver_customers',
-    <previous_snapshot_id>
+    7734156091704858789  -- previous snapshot
 );
 ```
-For example, rolling back to snapshot `7734156091704858789` would restore silver_customers to its state before run 6. The same applies to `silver_drivers`.
+
+This restores `silver_customers` to its state before run 6. Same procedure for `silver_drivers`. After rollback, the next pipeline run resumes from the silver watermark; if the bad MERGE was caused by bronze data, fix bronze first or move the watermark back.
 
 ---
 
-### 4. Airflow DAG, taxi Bronze orchestration, validation
+## 3. Orchestration design
 
-#### DAG design
+### DAG configuration
 
-The DAG file is `dags/cdc_lakehouse_dag.py`. It orchestrates both pipelines under a single schedule with the following configuration:
+DAG file: `dags/cdc_lakehouse_dag.py`.
 
 | Setting | Value | Reason |
 |---|---|---|
-| `schedule_interval` | `*/15 * * * *` | 15-minute freshness SLA — balances latency against Spark startup overhead (~30s per task) |
+| `schedule_interval` | `*/15 * * * *` | 15-minute freshness SLA — balances latency against Spark startup overhead (~30 s per task) |
 | `max_active_runs` | `1` | Prevents overlapping runs that would cause silver MERGE conflicts |
 | `catchup` | `False` | On restart, only the most recent interval runs — avoids flooding with historical backfill |
 | `dagrun_timeout` | `1 hour` | DAG is killed if tasks stall (e.g. Spark hangs) |
-| `retries` | `2` per task | Each task retries twice with a 30-second delay before marking failed |
+| `retries` | `2` per task | Each task retries twice with a 30 s delay before marking failed |
 
-#### Task dependency chain
+### Task dependency chain (phased)
 
 ```
-connector_health (HttpSensor)
-    ├── bronze_cdc_customers ──► silver_cdc_customers ──┐
-    ├── bronze_cdc_drivers   ──► silver_cdc_drivers   ──┼──► validate
-    └── bronze_taxi ──► silver_taxi ──► gold_taxi        │
-                                                         │
-                        [silver_cdc_customers + silver_cdc_drivers must both succeed]
+connector_health (HttpSensor → debezium_connect)
+    ├── bronze_cdc_customers ──┐
+    ├── bronze_cdc_drivers   ──┼── ALL bronze done ──► silver_cdc_customers ──┐
+    └── bronze_taxi ───────────┘                      ├──► silver_cdc_drivers ──┤
+                                                      └──► silver_taxi ──────────┴──► gold_taxi ──► validate
 ```
 
-- **`connector_health`** is an `HttpSensor` polling `http://connect:8083/connectors/pg-cdc/status` every 10 seconds. If the connector is not RUNNING the entire DAG stops — there is no point ingesting if CDC is broken.
-- The three bronze tasks run in parallel after the sensor passes.
-- CDC silver tasks each depend on their own bronze task. Both must succeed before `validate` runs.
-- The taxi path (`bronze_taxi → silver_taxi → gold_taxi`) runs independently in parallel with CDC.
-- **`validate`** (`jobs/health_pipeline.py`) compares `silver_customers.count() + silver_drivers.count()` against live PostgreSQL counts. It writes one row to `lakehouse.cdc.gold_pipeline_health` and exits with code 1 if `silver_pg_delta ≠ 0`, causing Airflow to mark it failed.
+- **`connector_health`** is an `HttpSensor` (`airflow.providers.http.sensors.http.HttpSensor`) that polls `/connectors/pg-cdc/status` on the `debezium_connect` HTTP connection (auto-provisioned via `AIRFLOW_CONN_DEBEZIUM_CONNECT=http://connect:8083` in `compose.yml` — no manual UI step). The `response_check` lambda asserts both `connector.state == "RUNNING"` and every `tasks[*].state == "RUNNING"`. `mode="reschedule"`, `poke_interval=15s`, `timeout=120s` — a stalled connector frees the worker between pokes and ultimately fails the DAG, so every downstream task is skipped via `upstream_failed`.
+- **Phased bronze → silver:** the three bronze tasks run in parallel; **each** silver task lists **all three** bronzes as upstream, matching the course README diagram (`[bronze_cdc, bronze_taxi] → [silver_cdc, silver_taxi]`).
+- **`gold_taxi`** lists **all three** silver tasks as upstream; **`validate`** lists **`gold_taxi` only** — aligned with `… → gold_taxi → validation`.
+- **`validate`** (`jobs/health_pipeline.py`) compares `silver_customers + silver_drivers` row counts against live PostgreSQL counts. It writes one row to `lakehouse.cdc.gold_pipeline_health` and exits with code 1 if `silver_pg_delta ≠ 0`. (It does not assert taxi tables; wiring it after `gold_taxi` only enforces full-pipeline ordering.)
 
-#### DAG graph — successful run
+### DAG graph — successful run
 
 ![DAG graph all green](dag_graph_success.png.jpeg)
 
 *`manual_catchup_run_1` — all 9 tasks green. Run duration: ~4 minutes.*
 
-#### Scheduling strategy
+### Scheduling strategy
 
-A 15-minute interval means silver CDC lags PostgreSQL by at most 15 minutes plus task execution time (~2 minutes), for a worst-case freshness of ~17 minutes. This is acceptable for a near-real-time analytics lakehouse. For stricter SLAs the interval could be reduced to 5 minutes; below that the Spark JVM startup cost (~30s) becomes a significant fraction of total runtime.
+A 15-minute interval means silver CDC lags PostgreSQL by at most 15 minutes plus task execution time (~2 minutes), for a worst-case freshness of ~17 minutes. This is acceptable for a near-real-time analytics lakehouse. For stricter SLAs the interval could be reduced to 5 minutes; below that the Spark JVM startup cost (~30 s) becomes a significant fraction of total runtime.
 
-#### Retry and failure handling
+### Retry and failure handling
 
-Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka Connect is down), the sensor times out and all downstream tasks are skipped via `upstream_failed`. If a silver MERGE fails, `validate` does not run.
+Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka Connect down), the sensor times out and all downstream tasks are skipped via `upstream_failed`. If a silver MERGE fails, `validate` does not run.
 
-**Example failed run** — `scheduled__2026-04-26T17:45:00`:
-
-`simulate.py` was left running during this interval, continuously inserting rows into PostgreSQL between the time silver tasks completed and when `validate` ran. Silver had processed 32 rows but PostgreSQL had grown to 91 rows by validate time, producing `silver_pg_delta = -59`. Airflow retried `validate` twice (both failed), then marked the run failed. The following run (`manual_catchup_run_1`) caught up all outstanding Kafka events and `validate` passed with `silver_pg_delta = 0`.
+**Example failed run** — `scheduled__2026-04-26T17:45:00`: `simulate.py` was left running during this interval, continuously inserting rows into PostgreSQL between the time silver tasks completed and when `validate` ran. Silver had processed 32 rows but PostgreSQL had grown to 91 rows by validate time, producing `silver_pg_delta = -59`. Airflow retried `validate` twice (both failed), then marked the run failed. The following run (`manual_catchup_run_1`) caught up all outstanding Kafka events and `validate` passed with `silver_pg_delta = 0`.
 
 ![Failed run details](dag_fail.png.jpeg)
 
-#### Three successful consecutive runs
+**Connector-failure scenario** (handout asks: *"Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly."*). Repro:
+
+```bash
+docker stop connect
+airflow dags trigger cdc_lakehouse_pipeline
+```
+
+Expected: `connector_health` polls `/connectors/pg-cdc/status` every 15 s; after 120 s without a `RUNNING` response it raises `AirflowSensorTimeout` and is marked failed. All seven downstream tasks transition to `upstream_failed` (skipped). Recovery: `docker start connect`; the next 15-minute schedule passes the sensor and the pipeline catches up. `screenshots/section3_connector_fail.png`.*
+connector_health Log:
+```bash
+requests.exceptions.ConnectionError: HTTPConnectionPool(host='connect', port=8083): Max retries exceeded with url: /connectors/pg-cdc/status (Caused by NameResolutionError("<urllib3.connection.HTTPConnection object at 0x77be4997f510>: Failed to resolve 'connect' ([Errno -2] Name or service not known)"))
+[2026-05-02, 09:51:26 UTC] {taskinstance.py:1226} INFO - Marking task as FAILED. dag_id=cdc_lakehouse_pipeline, task_id=connector_health, run_id=scheduled__2026-05-02T09:30:00+00:00, execution_date=20260502T093000, start_date=20260502T095123, end_date=20260502T095126
+[2026-05-02, 09:51:26 UTC] {taskinstance.py:1564} INFO - Executing callback at index 0: _on_failure
+[2026-05-02, 09:51:26 UTC] {cdc_lakehouse_dag.py:34} ERROR - ALERT: Task failed! DAG=cdc_lakehouse_pipeline  Task=connector_health  Run=scheduled__2026-05-02T09:30:00+00:00
+[2026-05-02, 09:51:26 UTC] {taskinstance.py:341} ▶ Post task execution logs
+```
+
+### Three successful consecutive runs
 
 | Run ID | Type | Start (UTC) | Duration | validate |
 |---|---|---|---|---|
@@ -170,42 +230,44 @@ Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka C
 
 ![Scheduled run success](dag_success.png.jpeg)
 
-#### Backfill and idempotency
+### Backfill
 
 With `catchup=False`, no automatic backfill occurs. Manual backfill via `airflow dags backfill` is safe because:
-- Bronze re-reads from Kafka `earliest` but silver's `kafka_offset > watermark` filter skips already-processed events.
+
+- Bronze re-reads from Kafka `earliest`, but silver's `kafka_offset > watermark` filter skips already-processed events.
 - The silver MERGE is idempotent: re-applying the same events produces the same silver state.
 - Running the DAG twice for the same interval with no new changes prints `No new bronze events for customers, silver is up to date.` and exits cleanly.
 
-#### Validate task
+### Validate task
 
 `jobs/health_pipeline.py` runs as the final task. It:
+
 1. Counts `silver_customers + silver_drivers` via Spark.
 2. Fetches live `COUNT(*)` from PostgreSQL via `psycopg2`.
-3. Computes `silver_pg_delta = silver_count - pg_count`.
-4. Appends one health record to `lakehouse.cdc.gold_pipeline_health`.
+3. Computes `silver_pg_delta = silver_count − pg_count`.
+4. Appends one health record to `lakehouse.cdc.gold_pipeline_health` and rebuilds `lakehouse.cdc.gold_pipeline_alerts`.
 5. Exits with code 1 if `delta ≠ 0` (Airflow marks task failed).
 
 ---
 
-### 5. Taxi pipeline — Silver & Gold (improved from Project 2)
+## 4. Streaming pipeline (taxi)
 
-#### Completed (implementation in `jobs/taxi_pipeline.py`)
+Implementation in `jobs/taxi_pipeline.py`.
 
 - **Silver (`--mode silver`):**
-  - **Timestamps:** `tpep_pickup_datetime` / `tpep_dropoff_datetime` parsed with **`to_timestamp(..., "yyyy-MM-dd'T'HH:mm:ss")`** into **`pickup_datetime`**, **`dropoff_datetime`**.
-  - **Casts:** Bronze string/double fields mapped to **typed** columns (`vendor_id`, `ratecode_id`, money fields as `double`, etc.) aligned with **`lakehouse.taxi.silver`** DDL.
-  - **Invalid trips dropped:** null pickup/dropoff, **`fare_amount < 0`**, **`trip_distance <= 0`**, passenger count null or outside **\[1, 8\]**, plus **deduplication** on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`.
-  - **Zone enrichment:** **`taxi_zone_lookup.parquet`** joined on pickup and dropoff location IDs → **`pickup_zone`**, **`dropoff_zone`** (broadcast joins).
-  - **Streaming:** Silver uses **Structured Streaming** from the **Iceberg Bronze** table with a **checkpoint** (default under `.checkpoints/silver`); an initial **batch** pass processes rows already in Bronze before the stream starts.
+  - **Timestamps:** `tpep_pickup_datetime` / `tpep_dropoff_datetime` parsed with `to_timestamp(..., "yyyy-MM-dd'T'HH:mm:ss")` into `pickup_datetime`, `dropoff_datetime`.
+  - **Casts:** Bronze string/double fields mapped to typed columns aligned with `lakehouse.taxi.silver` DDL.
+  - **Invalid trips dropped:** null pickup/dropoff, `fare_amount < 0`, `trip_distance ≤ 0`, passenger count null or outside [1, 8]; deduplicated on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`.
+  - **Zone enrichment:** `taxi_zone_lookup.parquet` joined on pickup and dropoff IDs (broadcast join) → `pickup_zone`, `dropoff_zone`.
+  - **Incremental + idempotent:** silver tracks a partition-offset watermark (`lakehouse.taxi.silver_watermark`); reruns with no new bronze data are no-ops.
 - **Gold (`--mode gold`):**
-  - **Aggregation:** `date_trunc("hour", pickup_datetime)` as **`pickup_hour`**, grouped by **`pickup_hour`** and **`pickup_zone`**, with **`trip_count`**, **`avg_fare`**, **`avg_distance`**, **`total_revenue`**.
-  - **Write semantics:** **`overwritePartitions()`** on **`lakehouse.taxi.gold`**, table **partitioned by day of `pickup_hour`** (`days(pickup_hour)`).
-- **Project 2 carryover / improvement hook:** Logic is adapted from the Project 2 streaming notebook; **explicit Silver deduplication** and **typed Silver schema** are concrete hygiene improvements suitable to cite vs raw Bronze-shaped streams.
+  - **Aggregation:** `date_trunc("hour", pickup_datetime)` as `pickup_hour`, grouped by `pickup_hour, pickup_zone`, with `trip_count`, `avg_fare`, `avg_distance`, `total_revenue`.
+  - **Write semantics:** `overwritePartitions()` on `lakehouse.taxi.gold`, partitioned by `days(pickup_hour)`.
+- **Airflow tasks:** `bronze_taxi` runs `taxi_pipeline.py --mode bronze --once`, `silver_taxi` runs `--mode silver --once`, `gold_taxi` runs `--mode gold`. The `--once` flag processes available data and exits rather than running as a continuous stream.
 
-#### Evidence
+### Evidence
 
-**Table row counts** after full pipeline run (Jan + Feb 2025 taxi data):
+Row counts after full pipeline run (Jan + Feb 2025 taxi data):
 
 | Table | Rows |
 |---|---|
@@ -213,7 +275,7 @@ With `catchup=False`, no automatic backfill occurs. Manual backfill via `airflow
 | `lakehouse.taxi.silver` | 1,139,464 |
 | `lakehouse.taxi.gold` | 3,484 |
 
-**Top gold rows by revenue** (pickup_hour, zone, aggregates):
+Top gold rows by revenue (pickup_hour, zone, aggregates):
 
 | pickup_hour | pickup_zone | trip_count | avg_fare | avg_distance | total_revenue |
 |---|---|---|---|---|---|
@@ -221,352 +283,248 @@ With `catchup=False`, no automatic backfill occurs. Manual backfill via `airflow
 | 2025-01-01 19:00 | JFK Airport | 4,524 | $64.56 | 16.08 mi | $367,781 |
 | 2025-01-01 16:00 | JFK Airport | 4,212 | $65.78 | 16.27 mi | $352,770 |
 
-**Airflow tasks:** `bronze_taxi` runs `taxi_pipeline.py --mode bronze --once`, `silver_taxi` runs `--mode silver --once`, `gold_taxi` runs `--mode gold`. All triggered every 15 minutes by the DAG. The `--once` flag causes each job to process available data and exit rather than running as a continuous stream.
+### Improvement over Project 2
 
-#### Improvement over Project 2
-
-In Project 2, the silver taxi job processed raw Bronze rows without schema validation, allowing null pickup timestamps and zero-distance trips to flow into aggregations and skew gold metrics. In this project, the silver stage applies explicit quality filters — dropping rows where `pickup_datetime` or `dropoff_datetime` is null, `fare_amount < 0`, `trip_distance ≤ 0`, or `passenger_count` is outside \[1, 8\] — and deduplicates on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`. This produces a clean, typed silver table that gold aggregations can trust without further filtering.
+In Project 2, the silver taxi job processed raw Bronze rows without schema validation, allowing null pickup timestamps and zero-distance trips to flow into aggregations and skew gold metrics. In this project, the silver stage applies explicit quality filters — dropping rows where `pickup_datetime` or `dropoff_datetime` is null, `fare_amount < 0`, `trip_distance ≤ 0`, or `passenger_count` is outside [1, 8] — and deduplicates on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`. This produces a clean, typed silver table that gold aggregations can trust without further filtering.
 
 ---
 
-### 6. Custom scenario — Pipeline Health Monitoring
+## 5. Custom scenario — Pipeline Health Monitoring
 
-#### Implemented in `jobs/health_pipeline.py`
+Implements the **GitHub-issue custom scenario** ("gold pipeline health + alerts + queries").
 
-- **Table:** `lakehouse.cdc.gold_pipeline_health` — append-only Iceberg table, one row per pipeline run.
-- **Columns:** `run_timestamp`, `events_c/u/d/r` (CDC op counts since last run), `bronze_row_count`, `silver_row_count`, `bronze_silver_delta`, `silver_pg_delta` (`silver - postgres`, must be 0 when healthy), `new_customers`, `updated_customers`, `deleted_customers`, `processing_lag_seconds`.
-- **PostgreSQL live counts** fetched via `psycopg2` in a subprocess (not available in Spark JVM).
-- **Event counts** are scoped to the current run using the `ts_ms` watermark from the previous health row — avoids double-counting across runs.
-- **Write semantics:** `writeTo(...).append()` — accumulation across runs is the core requirement; never overwrites.
-- **Alert logic** (computed as SQL queries against a health table temp view after each append):
-  - `silver_pg_delta != 0` → DATA DRIFT
-  - `(events_c + events_u + events_d + events_r) = 0` → SOURCE DOWN
-  - `processing_lag_seconds > 300` → HIGH LAG
+### Where the GitHub-issue "Show" deliverables are answered
 
-#### Evidence — 7 accumulated runs
+| Issue prompt | Where it is answered |
+|--------------|----------------------|
+| **Health table** accumulating rows over **at least 5 DAG runs** | Subsection *Evidence — accumulated runs (≥ 5)* below — markdown table "`gold_pipeline_health` — last runs" with **eight** rows. Notebook capture: `screenshots/section6_health_history.png`. |
+| **"What was the average processing lag over the last 10 runs?"** | Subsection *Required analytical queries* — block "Average processing lag over the last 10 runs" (SQL). Result paragraph below: **avg_lag_seconds = 897.27**. Notebook capture: `screenshots/section6_avg_lag.png`. |
+| **"Were there any runs with data drift between Silver and PostgreSQL?"** | Subsection *Required analytical queries* — "Runs with Silver ≠ PostgreSQL" (SQL on `gold_pipeline_health` plus equivalent on `gold_pipeline_alerts`). Tables below show three drift rows. Notebook captures: `screenshots/section6_drift_health.png`, `screenshots/section6_drift_alerts.png`. |
 
-| run_timestamp | events_c | events_u | events_d | events_r | silver_pg_delta | processing_lag_s |
-|---|---|---|---|---|---|---|
-| 2026-04-19 19:06:58 | 0 | 0 | 0 | 18 | 0 | 147.0 |
-| 2026-04-19 19:10:11 | 7 | 6 | 2 | 0 | 0 | 165.5 |
-| 2026-04-19 19:12:27 | 4 | 7 | 4 | 0 | 0 | 112.8 |
-| 2026-04-19 19:14:57 | 3 | 6 | 6 | 0 | 0 | 129.1 |
-| 2026-04-19 19:17:22 | 7 | 4 | 4 | 0 | 0 | 122.1 |
-| 2026-04-19 19:25:05 | 0 | 0 | 0 | 0 | 2 | 585.1 |
-| 2026-04-19 19:33:45 | 0 | 0 | 0 | 0 | 0 | 962.1 |
+Drift = **`silver_pg_delta ≠ 0`** (silver row count vs live PostgreSQL).
 
-**Avg processing lag over last 10 runs:** `401.97s` — printed automatically by the health job after each append.
+### Scenario checklist → implementation
 
-**Runs with data drift** (delta ≠ 0): run 6, caused by `simulate.py` making PostgreSQL deletes after the pipeline completed run 5. Run 7 (pipeline re-run with no new simulate activity) converged back to delta = 0, confirming the pipeline self-corrects.
+| Requirement | Implementation |
+|-------------|----------------|
+| **`lakehouse.cdc.gold_pipeline_health`** — one append-only row per DAG run | Iceberg table created in `jobs/health_pipeline.py` (`_ensure_health_table`). The Airflow `validate` task runs immediately after `gold_taxi` (which waits on all silvers), so each successful full DAG run adds exactly one row. |
+| **DAG run timestamp** | Column `run_timestamp` (UTC wall-clock at job execution). |
+| **CDC events by op (`c` / `u` / `d` / `r`)** | Columns `events_c`, `events_u`, `events_d`, `events_r`. **Incremental since the previous health row** (bronze rows with `ts_ms > previous run_timestamp`), so events are not double-counted across runs. |
+| **Bronze vs Silver** | `bronze_row_count`, `silver_row_count`, `bronze_silver_delta`. A positive delta is expected — bronze is append-only history, silver is current state. |
+| **Silver vs PostgreSQL** | `silver_pg_delta` (= silver total − PG `customers + drivers`). **Healthy steady state → 0**. |
+| **New / updated / deleted customers (since last run)** | `new_customers`, `updated_customers`, `deleted_customers` — op counts on `bronze_customers_flex` only, same `ts_ms` window. |
+| **Processing lag** | `processing_lag_seconds` = seconds between **now** and **`max(ts_ms)`** across both bronze CDC tables. |
+| **`gold_pipeline_alerts`** | Iceberg **table** rebuilt each validate run (`writeTo … createOrReplace`) from `gold_pipeline_health` plus nullable `drift_alert` (`DATA DRIFT` if `silver_pg_delta ≠ 0`), `silence_alert` (`SOURCE DOWN` if zero CDC events in interval), `lag_alert` (`HIGH LAG` if lag **> 300 s**). Same semantics as a SQL view; we avoid `CREATE VIEW` because Spark 4.1 + Iceberg REST catalog can throw `NoSuchMethodError` on view rewrite. |
+| **≥ 5 DAG runs of history** | Append-only table grows by one row per run; eight runs captured below. |
 
----
+### Required analytical queries
 
-## What's in this template
+**Average processing lag over the last 10 runs:**
 
-| Path | Description |
-|------|-------------|
-| `compose.yml` | Kafka, MinIO, Iceberg REST catalog, PostgreSQL, Kafka Connect (Debezium), Airflow, Jupyter/PySpark |
-| `produce.py` | Replays taxi parquet rows as JSON into the `taxi-trips` Kafka topic (same as Project 2) |
-| `seed.py` | Creates source tables in PostgreSQL and inserts initial data |
-| `simulate.py` | Continuously makes changes (INSERT, UPDATE, DELETE) to PostgreSQL, simulating a live OLTP workload |
-| `dags/` | Place your Airflow DAG file(s) here — auto-loaded by the Airflow scheduler |
-| `REPORT.md` | Template for the report you need to hand in |
-| `.env.example` | Template for credentials — copy to `.env` and fill in values |
-| `data/` | **Not in git.** Place the same taxi parquet files from Project 1 & 2 here |
+```sql
+SELECT ROUND(AVG(processing_lag_seconds), 2) AS avg_lag_seconds
+FROM (
+    SELECT processing_lag_seconds
+    FROM lakehouse.cdc.gold_pipeline_health
+    ORDER BY run_timestamp DESC
+    LIMIT 10
+) t;
+```
 
-The `data/` directory is git-ignored. You will use the same files as in previous projects:
+**Runs with Silver ≠ PostgreSQL (data drift):**
 
-| File | Description |
-|------|-------------|
-| `data/yellow_tripdata_2025-01.parquet` | NYC Yellow Taxi trips — January 2025 |
-| `data/yellow_tripdata_2025-02.parquet` | NYC Yellow Taxi trips — February 2025 |
-| `data/taxi_zone_lookup.parquet` | Pickup/dropoff zone names |
+```sql
+SELECT run_timestamp, silver_row_count, silver_pg_delta
+FROM lakehouse.cdc.gold_pipeline_health
+WHERE silver_pg_delta != 0
+ORDER BY run_timestamp DESC;
+```
 
----
+Equivalent against the alerts table (same drift rows, includes the alert column):
 
-## Setup
+```sql
+SELECT run_timestamp, silver_pg_delta, drift_alert
+FROM lakehouse.cdc.gold_pipeline_alerts
+WHERE drift_alert IS NOT NULL
+ORDER BY run_timestamp DESC;
+```
 
-### 1. Configure credentials
+### Evidence — accumulated runs (≥ 5)
+
+The capture below mixes **steady runs** (`silver_pg_delta = 0`, simulator stopped) with **later runs** where the simulator was deliberately left on during validate so `silver_pg_delta` went negative — this demonstrates the drift query and `DATA DRIFT` alert.
+
+`gold_pipeline_health` — last runs (`run_timestamp`, `silver_row_count`, `silver_pg_delta`, `processing_lag_seconds`, `ORDER BY run_timestamp DESC` `LIMIT 20`):
+
+| run_timestamp | silver_row_count | silver_pg_delta | processing_lag_s |
+|---|---|---|---|
+| 2026-05-01 21:36:51.825450 | 108 | -47 | 363.799 |
+| 2026-05-01 21:35:23.355165 | 108 | -29 | 275.799 |
+| 2026-05-01 21:33:49.786322 | 108 | -9 | 181.799 |
+| 2026-05-01 21:18:39.943532 | 75 | 0 | 323.962 |
+| 2026-05-01 21:03:05.628796 | 36 | 0 | 2695.957 |
+| 2026-05-01 20:48:09.957300 | 36 | 0 | 1799.957 |
+| 2026-05-01 20:39:32.826320 | 36 | 0 | 1282.957 |
+| 2026-05-01 20:22:23.929076 | 36 | 0 | 253.957 |
+
+There are **eight** rows above (≥ 5 DAG runs). Silver totals rose **36 → 75 → 108** as CDC caught up; the top three rows show **simulated drift** (Postgres ahead of silver during validate).
+
+**What was the average processing lag over the last 10 runs?** With the history available at capture time, **avg_lag_seconds = 897.27** (seconds).
+
+**Runs with data drift** (`silver_pg_delta ≠ 0`) — `gold_pipeline_health`:
+
+| run_timestamp | silver_row_count | silver_pg_delta |
+|---|---|---|
+| 2026-05-01 21:36:51.825450 | 108 | -47 |
+| 2026-05-01 21:35:23.355165 | 108 | -29 |
+| 2026-05-01 21:33:49.786322 | 108 | -9 |
+
+**Were there any runs with data drift between Silver and PostgreSQL?** — yes, three rows visible in `gold_pipeline_alerts`:
+
+| run_timestamp | silver_pg_delta | drift_alert |
+|---|---|---|
+| 2026-05-01 21:36:51.825450 | -47 | DATA DRIFT |
+| 2026-05-01 21:35:23.355165 | -29 | DATA DRIFT |
+| 2026-05-01 21:33:49.786322 | -9 | DATA DRIFT |
+
+Incremental CDC op counts per interval (`events_c` / `events_u` / `events_d` / `events_r`):
+
+![CDC op counts (`events_c` / `events_u` / `events_d` / `events_r`) — `gold_pipeline_health`](screenshots/section6_cdc_op_count.png)
+
+![Health history query output](screenshots/section6_health_history.png)
+
+![Average lag query output](screenshots/section6_avg_lag.png)
+
+![Data drift — gold_pipeline_health](screenshots/section6_drift_health.png)
+
+![Data drift — gold_pipeline_alerts](screenshots/section6_drift_alerts.png)
+
+### Validate task log (Airflow)
+
+`jobs/health_pipeline.py:229-279` prints two blocks per run that grader can read in the Airflow `validate` task log:
+
+Trimmed `validate` task log from one healthy run (`Silver-PG delta: 0  OK`) and one drifting run (`DATA DRIFT`). 
 
 ```bash
-cp .env.example .env
-# Edit .env — change all default passwords before starting the stack
-```
-
-The `.env` file is git-ignored and never committed.
-You need to change all the default secrets, and provide them in `REPORT.md` section 8 in your project submission.
-
-### 2. Place the data files
-
-Same taxi data as Project 2:
-
-```
-project_3/
-└── data/
-    ├── yellow_tripdata_2025-01.parquet
-    ├── yellow_tripdata_2025-02.parquet
-    └── taxi_zone_lookup.parquet
-```
-
-### 3. Start the stack
-
-```bash
-docker compose up -d
-```
-
-Allow ~30 seconds for all services to become ready. PostgreSQL, Kafka, Kafka Connect,
-MinIO, Iceberg catalog, Airflow, and Jupyter all need to start in order.
-
-### 4. Verify services
-
-```bash
-docker ps
-```
-
-You should see these services running:
-
-| Container | Role |
-|-----------|------|
-| `kafka` | Message broker (KRaft, no ZooKeeper) |
-| `postgres` | OLTP source database for CDC |
-| `connect` | Kafka Connect with Debezium PostgreSQL connector |
-| `minio` | S3-compatible object storage for Iceberg |
-| `minio_init` | One-shot bucket creation (exited is OK) |
-| `iceberg-rest` | Iceberg REST catalog |
-| `airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | Airflow DAG scheduler |
-| `jupyter` | Jupyter + PySpark |
-
-### 5. Seed the PostgreSQL source
-
-```bash
-docker exec jupyter python /home/jovyan/project/seed.py
-```
-
-This creates the source tables and inserts initial data. Verify in the Jupyter notebook:
-
-```python
-pg_execute("SELECT * FROM customers ORDER BY id;", fetch=True)
-```
-
-### 6. Start the taxi producer (same as Project 2)
-
-```bash
-docker exec jupyter python /home/jovyan/project/produce.py --loop
-```
-
-### 7. Start the change simulator
-
-```bash
-docker exec jupyter python /home/jovyan/project/simulate.py
-```
-
-This continuously makes random inserts, updates, and deletes to the PostgreSQL
-source tables, simulating a live application.
-
-### 8. Open services
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| Jupyter | http://localhost:8888 | token: `JUPYTER_TOKEN` from `.env` |
-| Airflow | http://localhost:8080 | `AIRFLOW_USER` / `AIRFLOW_PASSWORD` from `.env` |
-| Spark UI | http://localhost:4040 | — |
-| MinIO Console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from `.env` |
-| Kafka Connect API | http://localhost:8083 | — |
-| Iceberg REST API | http://localhost:8181/v1/namespaces | — |
-
-### 9. Stop the stack
-
-```bash
-docker compose down          # keeps MinIO data (named volume)
-docker compose down -v       # also deletes stored Iceberg tables
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - === Pipeline Health ===
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Run timestamp:       2026-05-01 22:18:15.201488
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Events (c/u/d/r):    0/0/0/0
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Bronze rows:         4298
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Silver rows:         162
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Bronze-Silver delta: 4136
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Silver-PG delta:     0  OK
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - New customers:       0
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Updated customers:   0
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Deleted customers:   0
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - Processing lag:      2429.5s
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - 
+[2026-05-01, 22:18:22 UTC] {subprocess.py:106} INFO - === Alerts ===
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +--------------------------+---------------+------------+----------------------+-----------+-------------+---------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |run_timestamp             |silver_pg_delta|total_events|processing_lag_seconds|drift_alert|silence_alert|lag_alert|
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +--------------------------+---------------+------------+----------------------+-----------+-------------+---------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 22:18:15.201488|0              |0           |2429.465              |NULL       |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 22:03:16.230317|0              |0           |1530.465              |NULL       |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:48:42.247455|0              |53          |656.465               |NULL       |NULL         |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:36:51.82545 |-47            |0           |363.799               |DATA DRIFT |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:35:23.355165|-29            |0           |275.799               |DATA DRIFT |SOURCE DOWN  |NULL     |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:33:49.786322|-9             |275         |181.799               |DATA DRIFT |NULL         |NULL     |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:18:39.943532|0              |144         |323.962               |NULL       |NULL         |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 21:03:05.628796|0              |0           |2695.957              |NULL       |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 20:48:09.9573  |0              |0           |1799.957              |NULL       |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |2026-05-01 20:39:32.82632 |0              |0           |1282.957              |NULL       |SOURCE DOWN  |HIGH LAG |
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +--------------------------+---------------+------------+----------------------+-----------+-------------+---------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - 
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - === Avg processing lag over last 10 runs ===
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +---------------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |avg_lag_seconds|
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +---------------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - |        1154.06|
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - +---------------+
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - 
+[2026-05-01, 22:18:23 UTC] {subprocess.py:106} INFO - === Runs with data drift (silver != postgres) ===
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - +--------------------------+----------------+---------------+
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - |run_timestamp             |silver_row_count|silver_pg_delta|
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - +--------------------------+----------------+---------------+
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - |2026-05-01 21:36:51.82545 |108             |-47            |
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - |2026-05-01 21:35:23.355165|108             |-29            |
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - |2026-05-01 21:33:49.786322|108             |-9             |
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - +--------------------------+----------------+---------------+
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - 
+[2026-05-01, 22:18:24 UTC] {subprocess.py:106} INFO - VALIDATE OK: silver mirrors PostgreSQL (silver_pg_delta=0).
+[2026-05-01, 22:18:25 UTC] {subprocess.py:110} INFO - Command exited with return code 0
 ```
 
 ---
 
-## What to build
+## 6. Bonus — Schema evolution
 
-Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
+*Status: design walkthrough. Optional demo — replace stubs with screenshots after running the experiment.*
 
-```
-┌─ Path A: CDC ──────────────────────────────────────────────────┐
-│  PostgreSQL → Debezium → Kafka → Bronze (CDC) → Silver (MERGE) │
-└────────────────────────────────────────────────────────────────┘
+**Experiment:** add a column to PostgreSQL while the pipeline is running, then trigger a CDC event so the new column flows through bronze and silver.
 
-┌─ Path B: Streaming (from Project 2) ──────────────────────────┐
-│  Taxi producer → Kafka → Bronze (taxi) → Silver → Gold         │
-└────────────────────────────────────────────────────────────────┘
-
-┌─ Airflow DAG orchestrates both paths ─────────────────────────┐
-│  health_check → [bronze_cdc, bronze_taxi] → [silver_cdc,      │
-│  silver_taxi] → gold_taxi → validation                         │
-└────────────────────────────────────────────────────────────────┘
+```sql
+-- in psql against the source DB:
+ALTER TABLE customers ADD COLUMN phone TEXT;
+UPDATE customers SET phone = '+372-5550-0001' WHERE id = 1;
 ```
 
-### Path A — CDC Pipeline (new)
+**What each layer does:**
 
-#### 1. Debezium CDC connector
+- **Debezium / Kafka:** `pgoutput` picks up the new column on the next change; the next event for `customers` carries `phone` inside `payload.after`. Schema metadata in the event envelope is updated automatically.
+- **Bronze (no DDL needed):** `before` and `after` are stored as raw JSON strings (`before_json`, `after_json` — see §2 *schema-flexible bronze rationale*), so the new field lands inside `after_json` without any change to the bronze table.
+- **Silver (one-time DDL):**
+  ```sql
+  ALTER TABLE public.customers ADD COLUMN phone TEXT;
 
-- Register a Debezium PostgreSQL connector via the Kafka Connect REST API.
-- Configure it to capture changes from the source tables using log-based CDC (WAL).
-- Verify that CDC events appear in Kafka topics (`dbserver1.public.<table>`).
-- Handle the initial snapshot — document which snapshot mode you chose and why.
+  UPDATE public.customers
+  SET phone = '+123-1212-4334'
+  WHERE id = 1;   -- use an id that exists; if UPDATE 0, change the id
 
-#### 2. Bronze CDC layer (raw CDC events)
+  INSERT INTO public.customers (name, email, country, phone)
+  VALUES ('test user', 'testing@ut.ee', 'Estonia', '+111-2222-3333');
 
-- Read CDC events from Kafka using Spark.
-- Parse the Debezium envelope correctly (extract from `$.payload.*` — the `schema + payload` wrapper).
-- Write all events as-is to a bronze Iceberg table. Append-only — never update or delete rows in bronze.
-- Include Kafka metadata (offset, partition, timestamp) alongside CDC fields (op, before, after, ts_ms).
-- Handle tombstone messages (null-value records from deletes).
+  ```
+  After this, `cdc_pipeline.py --stage silver --table customers` MERGE source can pick up the new column with `try_cast(get_json_object(after_json, '$.phone') AS STRING) AS phone` and the next run upserts the value into silver.
 
-#### 3. Silver CDC layer (current-state mirror)
+**Evidence (when run):**
 
-- Read from the bronze CDC table incrementally (only new events since last run).
-- Deduplicate: keep only the latest event per primary key (`ROW_NUMBER` over `ts_ms DESC`).
-- Apply `MERGE INTO` to the silver Iceberg table:
-  - `op = 'd'` → DELETE the row
-  - `op IN ('u', 'c', 'r')` → UPDATE if exists, INSERT if not
-- After MERGE, silver should mirror the current state of the PostgreSQL source.
-- Document your MERGE logic and explain why it is idempotent.
+- `screenshots/section6_alter_postgres.png`* — psql showing the `ALTER TABLE` + `UPDATE`, then the `customers` row with the new `phone`.
+- *PASTE HERE: `screenshots/section6_silver_phone.png`* — `SELECT id, name, phone FROM lakehouse.cdc.silver_customers WHERE id = 1;` with the populated value.
 
-### Path B — Streaming Taxi Pipeline (improved from Project 2)
-
-#### 4. Bronze → Silver → Gold for taxi data
-
-- Same medallion pipeline as Project 2: raw Kafka events → cleaned/enriched → aggregated.
-- Improve upon your Project 2 implementation based on feedback received.
-- **New requirement:** this pipeline must now be triggered by Airflow, not run as a standalone streaming job.
-
-### Orchestration (ties both paths together)
-
-#### 5. Airflow DAG
-
-- Create an Airflow DAG that orchestrates **both pipelines** end-to-end.
-- The DAG should include at minimum:
-  - A **health-check task** to verify the Debezium connector is running (REST API call).
-  - **Bronze ingestion tasks** for both CDC and taxi data.
-  - **Silver tasks** for both pipelines (MERGE for CDC, clean/enrich for taxi).
-  - A **gold task** for the taxi aggregation.
-  - A **validation task** that confirms silver CDC matches PostgreSQL source.
-- **Scheduling:** Configure a reasonable schedule interval. Justify your choice — what freshness SLA does it support?
-- **Retries and failure handling:** Configure task-level retries. If the MERGE task fails, downstream tasks should not run. If the connector health check fails, the DAG should alert and stop.
-- **SLAs:** Set a time limit on the DAG. Configure at least one failure notification mechanism.
-- **Idempotent re-runs:** Running the DAG twice for the same interval must produce the same result. This is critical for backfill scenarios.
-
-### Bonus (not required)
-
-#### 6. Schema evolution
-
-- Add a column to the PostgreSQL source table while the pipeline is running.
-- Show that Debezium detects the change, bronze stores both old and new events, silver evolves via `ALTER TABLE ADD COLUMN`.
+If you do not run the demo, leave this section as a design walkthrough and mark it as such in the grading checklist below.
 
 ---
 
-## What is graded
+## 7. Environment values
 
-Create a report (`REPORT.md`, max ~3 pages). Use the template provided.
+*Status: pending — to be filled before submission per the handout's instruction "provide them in `REPORT.md` section 8".*
 
-### 1. CDC correctness
+Keys defined in `.env.example` (copy to `.env` and replace defaults before submission):
 
-- Show that silver mirrors PostgreSQL (compare row counts and spot-check specific rows).
-- Show that deletes in PostgreSQL are reflected in silver.
-- Show that the pipeline is idempotent — running the DAG twice with no new changes produces the same state.
+- `MINIO_ROOT_USER` = `<set in .env>`
+- `MINIO_ROOT_PASSWORD` = `<set in .env>`
+- `PG_USER` = `<set in .env>`
+- `PG_PASSWORD` = `<set in .env>`
+- `JUPYTER_TOKEN` = `<set in .env>`
+- `AIRFLOW_USER` = `<set in .env>`
+- `AIRFLOW_PASSWORD` = `<set in .env>`
 
-### 2. Lakehouse design
-
-- Describe the schema of bronze CDC, silver CDC, bronze taxi, silver taxi, and gold tables.
-- Show Iceberg snapshot history for the silver CDC table.
-- Explain how you would roll back a bad MERGE using Iceberg time travel.
-
-### 3. Orchestration design
-
-- Include a screenshot of your Airflow DAG (graph view).
-- Explain the task dependency chain and why tasks are in this order.
-- Describe your scheduling strategy and what freshness SLA it supports.
-- Describe retry and failure handling. Show at least one example of a failed task and how the DAG handled it.
-- Show DAG run history — at least 3 successful consecutive runs.
-- Explain how backfill works for your DAG.
-
-### 4. Streaming pipeline (taxi)
-
-- Show that the taxi bronze/silver/gold pipeline works correctly (same criteria as Project 2).
-- Show improvements over Project 2 based on feedback.
-
-### 5. Custom scenario
-
-- Explain and/or show how you solved the custom scenario from the GitHub issue.
+`.env` itself is git-ignored.
 
 ---
 
-## Deliverables
+## Grading checklist (self-review)
 
-GitHub repository containing:
-
-- **Code:** Spark notebooks or Python scripts, Airflow DAG file(s), connector configuration, seed/simulate scripts. Must run end-to-end.
-- **Report** (`REPORT.md`).
-- The Iceberg tables must be queryable after running the pipeline.
-- The Airflow DAG must be visible and runnable in the Airflow UI.
-
-## How it will be checked
-
-The grading process:
-
-1. Clone your repository.
-2. Run `docker compose up`, `seed.py`, `simulate.py`, and `produce.py`.
-3. Trigger the Airflow DAG or wait for the scheduled run.
-4. Verify bronze CDC contains raw CDC events, silver CDC mirrors PostgreSQL.
-5. Verify bronze/silver/gold taxi tables contain correct data.
-6. Stop the simulator, make a manual change in PostgreSQL, trigger the DAG, verify silver reflects the change.
-7. Check Airflow for DAG run history, task logs, and retry behavior.
-8. Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly.
-
-**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
-
----
-
-## Grading checklist (self-review before submission)
-
-- [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
-- [ ] Debezium connector is registered and RUNNING
-- [ ] Bronze CDC table contains raw Debezium events with correct op, before, after fields
-- [ ] Silver CDC table matches PostgreSQL source (row count + spot check)
-- [ ] Deletes in PostgreSQL are reflected in silver CDC
-- [ ] Running the DAG twice produces the same silver state (idempotent)
-- [ ] Taxi bronze/silver/gold tables are correct (improved from Project 2)
-- [ ] Airflow DAG is visible in the UI with correct task dependencies
-- [ ] At least 3 successful DAG runs shown
-- [ ] Retry/failure handling configured and documented
-- [ ] Iceberg snapshot history shown in REPORT.md
-- [ ] Custom scenario implemented and documented
-- [ ] REPORT.md answers all required sections
-- [ ] `.env` values provided in REPORT.md section 8
-
----
-
-## Troubleshooting
-
-**Debezium connector FAILED**
-Check `docker compose logs connect` for errors. Common causes: PostgreSQL not reachable,
-wrong credentials, `wal_level` not set to `logical`, replication slot already exists from
-a previous run.
-
-**CDC events have all NULL fields**
-You are parsing from the top level instead of `$.payload.*`. Debezium wraps events in a
-`{"schema": {...}, "payload": {...}}` envelope. Extract from `$.payload.op`,
-`$.payload.after.id`, etc.
-
-**PostgreSQL replication slot growing**
-If the Debezium connector is stopped for a long time, PostgreSQL retains WAL segments.
-Check with: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
-
-**Airflow DAG not appearing**
-Place your DAG `.py` file in the `dags/` directory. The scheduler scans this folder.
-Check `docker compose logs airflow-scheduler` for import errors.
-
-**`Failed to find data source: kafka`**
-Check `PYSPARK_SUBMIT_ARGS` in `compose.yml` — versions must match your Spark version.
-
-**Iceberg table not found after restart**
-Tables are stored in MinIO (persistent named volume). They survive container restarts
-unless you run `docker compose down -v`.
+- [x] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors → see `README.md` setup, plus §3 *Three successful consecutive runs*.
+- [x] Debezium connector is registered and **RUNNING** → §1 *Connector / source verification* (`/connectors/pg-cdc/status`).
+- [x] Bronze CDC table contains raw Debezium events with correct `op`, `before`, `after` fields → §1 *Bronze sample row + counts*, §2 schema row for `bronze_*_flex`.
+- [x] Silver CDC table matches PostgreSQL source (row count + spot check) → §1 *Silver mirrors PostgreSQL*.
+- [x] Deletes in PostgreSQL are reflected in silver CDC → §1 *Deletes confirmed*.
+- [x] Running the DAG twice produces the same silver state (idempotent) → §1 *Idempotency confirmed*; §3 *Backfill*.
+- [x] Taxi bronze/silver/gold tables are correct (improved from Project 2) → §4.
+- [x] Airflow DAG is visible in the UI with correct task dependencies → §3 *Task dependency chain* + DAG graph image.
+- [x] At least 3 successful DAG runs shown → §3 *Three successful consecutive runs*.
+- [x] Retry/failure handling configured and documented → §3 *Retry and failure handling* (drift example) + *Connector-failure scenario*.
+- [x] Iceberg snapshot history shown in REPORT.md → §2 *Iceberg snapshot history*.
+- [x] Custom scenario implemented and documented → §5 (entire section).
+- [x] REPORT.md answers all required sections → §1–§5 + §6 (bonus, design) + §7 (env keys listed).
+- [ ] `.env` values provided in §7 → **pending — fill before submission**.

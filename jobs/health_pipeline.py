@@ -45,6 +45,41 @@ def _ensure_health_table(spark) -> str:
     return tgt
 
 
+def _ensure_alerts_view(spark) -> None:
+    """Expose health rows plus alert columns as `lakehouse.cdc.gold_pipeline_alerts`.
+
+    We use an Iceberg **table** refreshed each run (`createOrReplace`), not `CREATE VIEW`:
+    Spark 4.1 + Iceberg REST catalog can throw ``NoSuchMethodError`` on ``CREATE OR REPLACE VIEW``
+    (IcebergSparkSqlExtensions vs ``ResolvedIdentifier`` in Spark 4.1). Same query semantics as a view.
+    """
+    h = spark.table("lakehouse.cdc.gold_pipeline_health")
+    ev_sum = (
+        F.coalesce(F.col("events_c"), F.lit(0))
+        + F.coalesce(F.col("events_u"), F.lit(0))
+        + F.coalesce(F.col("events_d"), F.lit(0))
+        + F.coalesce(F.col("events_r"), F.lit(0))
+    )
+    alerts_df = (
+        h.withColumn(
+            "drift_alert",
+            F.when(F.col("silver_pg_delta") != F.lit(0), F.lit("DATA DRIFT")).otherwise(
+                F.lit(None).cast("string")
+            ),
+        )
+        .withColumn(
+            "silence_alert",
+            F.when(ev_sum == F.lit(0), F.lit("SOURCE DOWN")).otherwise(F.lit(None).cast("string")),
+        )
+        .withColumn(
+            "lag_alert",
+            F.when(F.col("processing_lag_seconds") > F.lit(300.0), F.lit("HIGH LAG")).otherwise(
+                F.lit(None).cast("string")
+            ),
+        )
+    )
+    alerts_df.writeTo("lakehouse.cdc.gold_pipeline_alerts").using("iceberg").createOrReplace()
+
+
 def _pg_counts() -> tuple[int, int]:
     # get live row counts from postgres
     import subprocess
@@ -189,6 +224,7 @@ def run_health(spark) -> None:
 
     health_df = spark.createDataFrame(row, schema)
     health_df.writeTo("lakehouse.cdc.gold_pipeline_health").append()
+    _ensure_alerts_view(spark)
 
     print(f"\n=== Pipeline Health ===")
     print(f"Run timestamp:       {now}")
@@ -254,6 +290,7 @@ def main() -> None:
     if drift != 0:
         print(f"VALIDATE FAILED: silver_pg_delta={drift}. Silver does not mirror PostgreSQL.")
         sys.exit(1)
+    print("VALIDATE OK: silver mirrors PostgreSQL (silver_pg_delta=0).")
 
 
 if __name__ == "__main__":
