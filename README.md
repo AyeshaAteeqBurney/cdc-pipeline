@@ -41,7 +41,7 @@ cp .env.example .env
 ```
 
 The `.env` file is git-ignored and never committed.
-You need to change all the default secrets, and provide them in `REPORT.md` section 8 in your project submission.
+You need to change all the default secrets, and provide them in `REPORT.md` section 7 in your project submission.
 
 ### 2. Place the data files
 
@@ -356,20 +356,20 @@ The grading process:
 
 ## Checklist
 
-- [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
-- [ ] Debezium connector is registered and RUNNING
-- [ ] Bronze CDC table contains raw Debezium events with correct op, before, after fields
-- [ ] Silver CDC table matches PostgreSQL source (row count + spot check)
-- [ ] Deletes in PostgreSQL are reflected in silver CDC
-- [ ] Running the DAG twice produces the same silver state (idempotent)
-- [ ] Taxi bronze/silver/gold tables are correct (improved from Project 2)
-- [ ] Airflow DAG is visible in the UI with correct task dependencies
-- [ ] At least 3 successful DAG runs shown
-- [ ] Retry/failure handling configured and documented
-- [ ] Iceberg snapshot history shown in REPORT.md
-- [ ] Custom scenario implemented and documented
-- [ ] REPORT.md answers all required sections
-- [ ] `.env` values provided in REPORT.md section 8
+- [x] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
+- [x] Debezium connector is registered and RUNNING
+- [x] Bronze CDC table contains raw Debezium events with correct op, before, after fields
+- [x] Silver CDC table matches PostgreSQL source (row count + spot check)
+- [x] Deletes in PostgreSQL are reflected in silver CDC
+- [x] Running the DAG twice produces the same silver state (idempotent)
+- [x] Taxi bronze/silver/gold tables are correct (improved from Project 2)
+- [x] Airflow DAG is visible in the UI with correct task dependencies
+- [x] At least 3 successful DAG runs shown
+- [x] Retry/failure handling configured and documented
+- [x] Iceberg snapshot history shown in REPORT.md
+- [x] Custom scenario implemented and documented
+- [x] REPORT.md answers all required sections
+- [x] `.env` values provided in REPORT.md section 7
 
 ---
 

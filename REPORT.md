@@ -125,12 +125,11 @@ SELECT 'bronze_customers_flex' AS table, COUNT(*) AS rows FROM lakehouse.cdc.bro
 UNION ALL
 SELECT 'bronze_drivers_flex',           COUNT(*)       FROM lakehouse.cdc.bronze_drivers_flex;
 ```
-+---------------------+----+
-|table                |rows|
-+---------------------+----+
-|bronze_customers_flex|2560|
-|bronze_drivers_flex  |1738|
-+---------------------+----+
+
+| table                  | rows |
+|------------------------|-----:|
+| bronze_customers_flex  | 2560 |
+| bronze_drivers_flex    | 1738 |
 
 Note: bronze counts grow faster than silver (bronze is append-only event history; silver is current state), so a positive `bronze_row_count − silver_row_count` is expected.
 
@@ -227,7 +226,7 @@ connector_health (HttpSensor → debezium_connect)
 
 ### DAG graph — successful run
 
-![DAG graph all green](screenshots\dag_graph_success.png)
+![DAG graph all green](screenshots/dag_graph_success.png)
 
 *`manual_catchup_run_1` — all 9 tasks green. Run duration: 00:03:14 minutes.*
 
@@ -241,7 +240,7 @@ Each task has `retries=2, retry_delay=30s`. If `connector_health` fails (Kafka C
 
 **Example failed `validate`** — `scheduled__2026-05-01T21:15:00+00:00`: while the OLTP workload was still changing faster than the scheduled DAG could fully catch up, silver row counts lagged live PostgreSQL at the moment `health_pipeline.py` ran. The task logged `Silver-PG delta: -47  DRIFT DETECTED`, `VALIDATE FAILED: silver_pg_delta=-47`, exit code 1; Airflow marked `validate` failed and ran the `on_failure` callback. A later run after catching up Kafka/bronze/silver returned `silver_pg_delta = 0`.
 
-![Airflow Graph — `validate` failed for drift](screenshots\dag_fail.png)
+![Airflow Graph — `validate` failed for drift](screenshots/dag_fail.png)
 
 **Connector-failure scenario** — stop Kafka Connect and confirm the DAG surfaces the failure at `connector_health`. Repro:
 
@@ -274,7 +273,7 @@ Five scheduled runs on **2026-05-01** (logical times 20:00–21:00 UTC) complete
 | `scheduled__2026-05-01T20:45:00+00:00` | scheduled | 2026-05-01 21:00:01 | 03:12 | success |
 | `scheduled__2026-05-01T21:00:00+00:00` | scheduled | 2026-05-01 21:15:01 | 03:46 | success |
 
-![Airflow DAG Runs — five successes (highlighted in UI)](screenshots\dag_success.png)
+![Airflow DAG Runs — five successes (highlighted in UI)](screenshots/dag_success.png)
 
 ### Backfill
 
@@ -331,22 +330,22 @@ Expected consistency checks for a healthy run:
 - `gold` contains hourly-zone aggregates derived from `silver` (the **gold row count** is the number of **`(pickup_hour, pickup_zone)`** groups, not the trip count),
 - `avg_fare` is `avg(fare_amount)` while `total_revenue` is `sum(total_amount)` on silver, so `trip_count * avg_fare` need not equal `total_revenue`.
 
-+------+----+
-|tbl   |rows|
-+------+----+
-|bronze|666 |
-|silver|637 |
-|gold  |63  |
-+------+----+
+| tbl    | rows |
+|--------|-----:|
+| bronze |  666 |
+| silver |  637 |
+| gold   |   63 |
 
-Top gold rows by revenue (pickup_hour, zone, aggregates):
-+-------------------+-----------------------------+----------+------------------+------------------+------------------+
-|pickup_hour        |pickup_zone                  |trip_count|avg_fare          |avg_distance      |total_revenue     |
-+-------------------+-----------------------------+----------+------------------+------------------+------------------+
-|2025-01-01 00:00:00|LaGuardia Airport            |19        |33.72631578947368 |8.053684210526317 |1033.2199999999998|
-|2025-01-01 00:00:00|East Village                 |39        |15.079487179487177|2.286153846153846 |902.7700000000001 |
-|2025-01-01 00:00:00|Upper East Side South        |43        |12.165116279069766|1.7688372093023257|843.2099999999999 |
-|2025-01-01 00:00:00|Lincoln Square East          |36        |13.052777777777777|1.9019444444444444|761.33            |
+Top gold rows by revenue (`pickup_hour`, zone, aggregates):
+
+| pickup_hour         | pickup_zone             | trip_count | avg_fare | avg_distance | total_revenue |
+|---------------------|-------------------------|----------:|---------:|-------------:|--------------:|
+| 2025-01-01 00:00:00 | LaGuardia Airport       |        19 |    33.73 |         8.05 |       1033.22 |
+| 2025-01-01 00:00:00 | East Village            |        39 |    15.08 |         2.29 |        902.77 |
+| 2025-01-01 00:00:00 | Upper East Side South   |        43 |    12.17 |         1.77 |        843.21 |
+| 2025-01-01 00:00:00 | Lincoln Square East     |        36 |    13.05 |         1.90 |        761.33 |
+
+*(Numeric columns rounded to two decimals for readability; underlying Iceberg values may have full floating-point precision.)*
 
 ### Improvement over Project 2
 
