@@ -7,7 +7,12 @@ Notebook-first friendly: this script is runnable from inside the `jupyter` conta
   docker exec jupyter python /home/jovyan/project/jobs/taxi_pipeline.py --mode silver
   docker exec jupyter python /home/jovyan/project/jobs/taxi_pipeline.py --mode gold
 
-Bronze + Silver run as Structured Streaming with checkpoints under `.checkpoints/`.
+Bronze uses Structured Streaming from Kafka with checkpoints under `.checkpoints/bronze`.
+
+Silver reads **incrementally** from the Iceberg bronze table using a per-partition Kafka
+offset watermark (`lakehouse.taxi.silver_bronze_watermark`) and **MERGE** upserts into
+silver on the natural trip key — idempotent under repeated Airflow `--once` runs.
+
 Gold is a batch aggregation overwriting partitions.
 """
 
@@ -15,10 +20,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+import time
+from functools import reduce
 from pathlib import Path
 
 import pyspark.sql.functions as F
+from pyspark.sql import Window
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -114,6 +123,80 @@ def _ensure_namespaces_and_tables(spark) -> None:
         """
     )
 
+    _ensure_silver_kafka_columns(spark)
+
+
+def _silver_column_names(spark) -> set[str]:
+    return set(spark.table("lakehouse.taxi.silver").columns)
+
+
+def _ensure_silver_kafka_columns(spark) -> None:
+    """Ensure silver has kafka_partition / kafka_offset for watermark MERGE idempotency."""
+    existing = _silver_column_names(spark)
+    if "kafka_partition" not in existing:
+        spark.sql("ALTER TABLE lakehouse.taxi.silver ADD COLUMN kafka_partition INT")
+    if "kafka_offset" not in existing:
+        spark.sql("ALTER TABLE lakehouse.taxi.silver ADD COLUMN kafka_offset LONG")
+
+
+def _get_bronze_watermark(spark) -> dict[int, int]:
+    """Returns {partition: max_kafka_offset} already processed by taxi silver."""
+    wm_tbl = "lakehouse.taxi.silver_bronze_watermark"
+    try:
+        rows = spark.read.table(wm_tbl).collect()
+        return {int(r["partition"]): int(r["max_offset"]) for r in rows}
+    except Exception:
+        return {}
+
+
+def _save_bronze_watermark(spark, processed_df) -> None:
+    wm_tbl = "lakehouse.taxi.silver_bronze_watermark"
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {wm_tbl} (
+            partition INT,
+            max_offset LONG
+        )
+        USING iceberg
+        """
+    )
+    new_max = (
+        processed_df.groupBy("kafka_partition")
+        .agg(F.max("kafka_offset").alias("max_offset"))
+        .withColumnRenamed("kafka_partition", "partition")
+    )
+    # Break Iceberg scan lineage before MERGE (same pattern as jobs/cdc_pipeline.py).
+    new_max_local = spark.createDataFrame(new_max.collect(), new_max.schema)
+    new_max_local.createOrReplaceTempView("new_taxi_bronze_wm")
+    spark.sql(
+        f"""
+        MERGE INTO {wm_tbl} AS target
+        USING new_taxi_bronze_wm AS source
+        ON target.partition = source.partition
+        WHEN MATCHED THEN UPDATE SET target.max_offset = source.max_offset
+        WHEN NOT MATCHED THEN INSERT (partition, max_offset) VALUES (source.partition, source.max_offset)
+        """
+    )
+
+
+def _filter_new_bronze(df, wm: dict[int, int]):
+    if not wm:
+        return df
+    conditions = [
+        (F.col("kafka_partition") == part) & (F.col("kafka_offset") > off) for part, off in wm.items()
+    ]
+    seen = list(wm.keys())
+    cond = reduce(lambda a, b: a | b, conditions)
+    cond = cond | ~F.col("kafka_partition").isin(seen)
+    return df.filter(cond)
+
+
+def _parse_trigger_seconds(trigger: str) -> float:
+    m = re.match(r"^\s*(\d+)\s*seconds?\s*$", trigger.strip(), re.I)
+    if m:
+        return float(m.group(1))
+    return 5.0
+
 
 def _taxi_schema() -> StructType:
     # Mirrors the Project 2 schema (relaxed types + nullable `airport_fee`).
@@ -200,6 +283,10 @@ def run_bronze_stream(spark, bootstrap: str, topic: str, checkpoint: str, trigge
 
 
 def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: str, once: bool = False) -> None:
+    # `--silver-checkpoint` retained for CLI compatibility; silver uses Kafka offset watermark, not Spark checkpoints.
+    _ = checkpoint
+    _ensure_silver_kafka_columns(spark)
+
     zone_lookup = (
         spark.read.parquet(zone_lookup_path)
         .select(F.col("LocationID").cast("int").alias("location_id"), F.col("Zone").alias("zone_name"))
@@ -209,12 +296,16 @@ def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: st
     pu_lookup = zone_lookup.withColumnRenamed("location_id", "_pu_id").withColumnRenamed("zone_name", "pickup_zone")
     do_lookup = zone_lookup.withColumnRenamed("location_id", "_do_id").withColumnRenamed("zone_name", "dropoff_zone")
 
-    def _process_silver_batch(batch_df, batch_id: int) -> None:
-        if batch_df.isEmpty():
-            return
+    def _silver_incremental_pass() -> bool:
+        bronze_df = spark.read.table("lakehouse.taxi.bronze")
+        wm = _get_bronze_watermark(spark)
+        new_bronze = _filter_new_bronze(bronze_df, wm)
+        if not new_bronze.take(1):
+            print("No new bronze rows for taxi silver (watermark up to date).")
+            return False
 
         typed = (
-            batch_df.withColumn("vendor_id", F.col("VendorID").cast(IntegerType()))
+            new_bronze.withColumn("vendor_id", F.col("VendorID").cast(IntegerType()))
             .withColumn("pickup_datetime", F.to_timestamp("tpep_pickup_datetime", "yyyy-MM-dd'T'HH:mm:ss"))
             .withColumn("dropoff_datetime", F.to_timestamp("tpep_dropoff_datetime", "yyyy-MM-dd'T'HH:mm:ss"))
             .withColumn("passenger_count", F.col("passenger_count").cast(IntegerType()))
@@ -244,13 +335,25 @@ def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: st
                 & (F.col("passenger_count") >= 1)
                 & (F.col("passenger_count") <= 8)
             )
-            .dropDuplicates(["vendor_id", "pickup_datetime", "dropoff_datetime", "pu_location_id", "do_location_id"])
+        )
+
+        # Latest Kafka offset wins per natural trip key within this micro-batch.
+        trip_keys = ["vendor_id", "pickup_datetime", "dropoff_datetime", "pu_location_id", "do_location_id"]
+
+        w = Window.partitionBy(*trip_keys).orderBy(
+            F.col("kafka_partition"),
+            F.col("kafka_offset").desc(),
+        )
+        deduped = (
+            cleaned.withColumn("_rn", F.row_number().over(w))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
         )
 
         enriched = (
-            cleaned.join(F.broadcast(pu_lookup), cleaned.pu_location_id == pu_lookup._pu_id, "left")
+            deduped.join(F.broadcast(pu_lookup), deduped.pu_location_id == pu_lookup._pu_id, "left")
             .drop("_pu_id")
-            .join(F.broadcast(do_lookup), cleaned.do_location_id == do_lookup._do_id, "left")
+            .join(F.broadcast(do_lookup), deduped.do_location_id == do_lookup._do_id, "left")
             .drop("_do_id")
             .select(
                 "vendor_id",
@@ -274,28 +377,53 @@ def run_silver_stream(spark, zone_lookup_path: str, checkpoint: str, trigger: st
                 "cbd_congestion_fee",
                 "pickup_zone",
                 "dropoff_zone",
+                "kafka_partition",
+                "kafka_offset",
             )
         )
 
-        enriched.writeTo("lakehouse.taxi.silver").append()
+        if not enriched.take(1):
+            _save_bronze_watermark(spark, new_bronze)
+            print("New bronze rows existed but all were filtered as invalid; watermark advanced.")
+            return True
 
-    # When once=True (Airflow mode), a plain batch read covers everything available.
-    # Skipping the streaming query avoids a Spark 4.x BlockManagerId NPE with
-    # trigger(availableNow=True) on Iceberg sources.
-    _process_silver_batch(spark.read.table("lakehouse.taxi.bronze"), 0)
+        cols = enriched.columns
+        merge_cols = [c for c in cols if c not in trip_keys]
+        set_clause = ", ".join(f"target.{c} = source.{c}" for c in merge_cols)
+        insert_cols = ", ".join(cols)
+        insert_vals = ", ".join(f"source.{c}" for c in cols)
+
+        # Recreate from collected rows to break Iceberg lineage before MERGE (Spark 4 + Iceberg
+        # can assert "No plan for TableReference" when the MERGE source view still scans bronze).
+        upsert_local = spark.createDataFrame(enriched.collect(), enriched.schema)
+        upsert_local.createOrReplaceTempView("taxi_silver_upserts")
+
+        spark.sql(
+            f"""
+            MERGE INTO lakehouse.taxi.silver AS target
+            USING taxi_silver_upserts AS source
+            ON target.vendor_id = source.vendor_id
+               AND target.pickup_datetime = source.pickup_datetime
+               AND target.dropoff_datetime = source.dropoff_datetime
+               AND target.pu_location_id = source.pu_location_id
+               AND target.do_location_id = source.do_location_id
+            WHEN MATCHED THEN UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+            """
+        )
+
+        _save_bronze_watermark(spark, new_bronze)
+        print("Taxi silver MERGE complete.")
+        return True
+
     if once:
+        _silver_incremental_pass()
         return
 
-    os.makedirs(checkpoint, exist_ok=True)
-    (
-        spark.readStream.format("iceberg")
-        .load("lakehouse.taxi.bronze")
-        .writeStream.foreachBatch(_process_silver_batch)
-        .option("checkpointLocation", checkpoint)
-        .trigger(processingTime=trigger)
-        .start()
-        .awaitTermination()
-    )
+    interval = _parse_trigger_seconds(trigger)
+    while True:
+        _silver_incremental_pass()
+        time.sleep(interval)
 
 
 def run_gold_batch(spark) -> None:

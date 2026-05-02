@@ -191,7 +191,7 @@ Iceberg tables: `lakehouse.cdc.bronze_customers_flex`, `lakehouse.cdc.bronze_dri
 ### Taxi medallion (`jobs/taxi_pipeline.py`)
 
 **Bronze** can run continuously (streaming) or one-shot (`--once`) for Airflow.  
-**Silver** is incremental and idempotent via a per-partition Kafka offset watermark (`lakehouse.taxi.silver_watermark`) and supports both continuous and one-shot modes.  
+**Silver** reads new rows from the Iceberg bronze table incrementally using a per-partition Kafka offset watermark table (`lakehouse.taxi.silver_bronze_watermark`) and **MERGE** upserts into `lakehouse.taxi.silver` on the natural trip key — idempotent on repeated `--once` runs (no Spark structured-streaming checkpoint for silver; avoids Iceberg streaming + local checkpoint URI issues under MinIO).  
 **Gold** is a batch aggregation job that exits.
 
 ```bash

@@ -305,7 +305,7 @@ Implementation in `jobs/taxi_pipeline.py`.
   - **Casts:** Bronze string/double fields mapped to typed columns aligned with `lakehouse.taxi.silver` DDL.
   - **Invalid trips dropped:** null pickup/dropoff, `fare_amount < 0`, `trip_distance ≤ 0`, passenger count null or outside [1, 8]; deduplicated on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`.
   - **Zone enrichment:** `taxi_zone_lookup.parquet` joined on pickup and dropoff IDs (broadcast join) → `pickup_zone`, `dropoff_zone`.
-  - **Incremental + idempotent:** silver tracks a partition-offset watermark (`lakehouse.taxi.silver_watermark`); reruns with no new bronze data are no-ops.
+  - **Watermark + MERGE idempotency:** silver selects bronze rows **after** the last processed `(kafka_partition, kafka_offset)` recorded in `lakehouse.taxi.silver_bronze_watermark`, transforms them, dedupes within the batch by natural trip key (latest offset wins), then **MERGE** upserts into `lakehouse.taxi.silver`. Airflow `--once` runs one pass; reruns with no new bronze advance the watermark only when applicable and do not duplicate silver rows.
 - **Gold (`--mode gold`):**
   - **Aggregation:** `date_trunc("hour", pickup_datetime)` as `pickup_hour`, grouped by `pickup_hour, pickup_zone`, with `trip_count`, `avg_fare`, `avg_distance`, `total_revenue`.
   - **Write semantics:** `overwritePartitions()` on `lakehouse.taxi.gold`, partitioned by `days(pickup_hour)`.
@@ -313,25 +313,45 @@ Implementation in `jobs/taxi_pipeline.py`.
 
 ### Evidence
 
-Row counts after full pipeline run (Jan + Feb 2025 taxi data):
+**Partial run (demo window):** the figures below are from one successful pipeline execution with a **limited bronze ingest** (Kafka / DAG schedule), not the full TLC dataset. Absolute counts are therefore illustrative; what matters is **relative consistency** (bronze → silver → gold) and **non-zero** end states.
 
-| Table | Rows |
-|---|---|
-| `lakehouse.taxi.bronze` | 109,546 |
-| `lakehouse.taxi.silver` | 1,139,464 |
-| `lakehouse.taxi.gold` | 3,484 |
+Taxi row-count evidence should be captured from the current run state (counts vary with run duration and whether bronze/silver watermarks were reset). Use:
+
+```sql
+SELECT 'bronze' AS tbl, COUNT(*) AS rows FROM lakehouse.taxi.bronze
+UNION ALL
+SELECT 'silver', COUNT(*) FROM lakehouse.taxi.silver
+UNION ALL
+SELECT 'gold',   COUNT(*) FROM lakehouse.taxi.gold;
+```
+
+Expected consistency checks for a healthy run:
+- all three counts are non-zero,
+- `silver` reflects cleaned/deduplicated bronze trips,
+- `gold` contains hourly-zone aggregates derived from `silver` (the **gold row count** is the number of **`(pickup_hour, pickup_zone)`** groups, not the trip count),
+- `avg_fare` is `avg(fare_amount)` while `total_revenue` is `sum(total_amount)` on silver, so `trip_count * avg_fare` need not equal `total_revenue`.
+
++------+----+
+|tbl   |rows|
++------+----+
+|bronze|666 |
+|silver|637 |
+|gold  |63  |
++------+----+
 
 Top gold rows by revenue (pickup_hour, zone, aggregates):
-
-| pickup_hour | pickup_zone | trip_count | avg_fare | avg_distance | total_revenue |
-|---|---|---|---|---|---|
-| 2025-01-01 21:00 | JFK Airport | 4,692 | $65.08 | 16.16 mi | $385,989 |
-| 2025-01-01 19:00 | JFK Airport | 4,524 | $64.56 | 16.08 mi | $367,781 |
-| 2025-01-01 16:00 | JFK Airport | 4,212 | $65.78 | 16.27 mi | $352,770 |
++-------------------+-----------------------------+----------+------------------+------------------+------------------+
+|pickup_hour        |pickup_zone                  |trip_count|avg_fare          |avg_distance      |total_revenue     |
++-------------------+-----------------------------+----------+------------------+------------------+------------------+
+|2025-01-01 00:00:00|LaGuardia Airport            |19        |33.72631578947368 |8.053684210526317 |1033.2199999999998|
+|2025-01-01 00:00:00|East Village                 |39        |15.079487179487177|2.286153846153846 |902.7700000000001 |
+|2025-01-01 00:00:00|Upper East Side South        |43        |12.165116279069766|1.7688372093023257|843.2099999999999 |
+|2025-01-01 00:00:00|Lincoln Square East          |36        |13.052777777777777|1.9019444444444444|761.33            |
 
 ### Improvement over Project 2
 
-In Project 2, the silver taxi job processed raw Bronze rows without schema validation, allowing null pickup timestamps and zero-distance trips to flow into aggregations and skew gold metrics. In this project, the silver stage applies explicit quality filters — dropping rows where `pickup_datetime` or `dropoff_datetime` is null, `fare_amount < 0`, `trip_distance ≤ 0`, or `passenger_count` is outside [1, 8] — and deduplicates on `(vendor_id, pickup_datetime, dropoff_datetime, pu_location_id, do_location_id)`. This produces a clean, typed silver table that gold aggregations can trust without further filtering.
+Project 2 already received full marks, so the taxi transformation quality rules are intentionally carried over rather than changed (same typed silver schema, cleaning filters, dedup keys, and zone enrichment).  
+The improvement in Project 3 is orchestration and integration: the taxi Bronze/Silver/Gold flow now runs under the shared Airflow DAG together with CDC tasks, with scheduled retries/failure handling and end-to-end validation sequencing.
 
 ---
 
