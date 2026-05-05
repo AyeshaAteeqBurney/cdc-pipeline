@@ -545,7 +545,7 @@ Then run bronze for `customers`, then `cdc_pipeline.py --stage silver --table cu
 ```bash
 ALTER TABLE public.customers ADD COLUMN phone TEXT;
 UPDATE public.customers SET phone = '+111-2222-3345' WHERE name = 'test user';
-INSERT INTO public.customers (name, email, country, phone) VALUES ('test user', 'testing@ut.ee', 'Estonia', '+111-2222-3333');
+INSERT INTO public.customers (name, email, country, phone) VALUES ('test user', 'testing@ut.ee', 'Estonia', '+111-2222-3233');
 ```
 
 - `screenshots/section6_silver_phone.png` — `SELECT phone FROM lakehouse.cdc.silver_customers WHERE name = 'test user';` with the populated value.
